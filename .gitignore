@@ -1,0 +1,8 @@
+node_modules/
+frontend/dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+src-tauri/WixTools/
+.DS_Store
+*.tsbuildinfo
+release/

@@ -1,0 +1,54 @@
+[package]
+name = "fly-reader"
+version = "1.1.0"
+description = "FlyReader 轻量小说阅读器（Tauri 版）"
+authors = ["飞鸟传说 <17472439chaochao@gmail.com>"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "fly_reader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "backup"] }
+chrono = { version = "0.4", default-features = false }
+base64 = "0.22"
+font-kit = "0.14"
+rquickjs = "0.14"
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate"] }
+encoding_rs = "0.8"
+url = "2"
+percent-encoding = "2"
+regex = "1"
+scraper = "0.27"
+sxd-document = "0.3"
+sxd-xpath = "0.4"
+jsonpath-plus = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["std"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+sha1_smol = "1"
+tauri-plugin-global-shortcut = "2.4.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# 体积优先（原版 Electron 包 ~108MB，目标是十 MB 级）
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = "s"
+strip = true
+# 刻意不设 panic = "abort"：本地书解析跑在 spawn_blocking 里，
+# panic 要能展开成 `导入失败：…` 让主进程活着（对应原版 worker 崩溃不影响主进程）
+

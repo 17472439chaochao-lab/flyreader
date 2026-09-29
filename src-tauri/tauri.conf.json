@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FlyReader",
+  "version": "1.1.0",
+  "identifier": "com.flyreader.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev:fe",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build:fe",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "FlyReader",
+        "width": 1100,
+        "height": 740,
+        "minWidth": 860,
+        "minHeight": 560,
+        "resizable": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 16 }
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: http://asset.localhost blob: data: https: http:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "publisher": "飞鸟传说 <17472439chaochao@gmail.com>",
+    "copyright": "Copyright © 2026 飞鸟传说",
+    "category": "public.app-category.entertainment",
+    "license": "MIT",
+    "shortDescription": "轻量小说阅读器",
+    "longDescription": "轻量小说阅读器，支持本地 TXT/EPUB/Markdown、在线搜索阅读与导出，兼容 Legado 书源",
+    "targets": ["dmg", "nsis", "msi", "appimage", "deb"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
