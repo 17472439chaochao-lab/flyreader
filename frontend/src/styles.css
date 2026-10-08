@@ -1558,6 +1558,38 @@ html.theme-night .badge.match-low {
   animation: spin 700ms linear infinite;
 }
 
+/* 书源批量测试：居中进度弹窗，避免挤进工具栏导致按钮文字重叠 */
+.test-progress-card {
+  width: min(420px, calc(100vw - 48px));
+  padding: 20px 22px 16px;
+  border-radius: 16px;
+  background: var(--surface-strong);
+  box-shadow: 0 8px 28px color-mix(in srgb, var(--ink) 14%, transparent);
+  color: var(--ink);
+  animation: rise 220ms ease;
+}
+
+.test-progress-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  font-size: 15px;
+}
+
+.test-progress-head .icon {
+  color: var(--accent);
+}
+
+.test-progress-label {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .search-history {
   margin: 0 0 16px;
 }

@@ -11,6 +11,7 @@ import {
   IconCheck,
   IconFilter,
   IconGear,
+  IconLink,
   IconNext,
   IconPrev,
   IconToc,
@@ -108,6 +109,8 @@ export const ReaderView = memo(function ReaderView({
   onAddPurify: (text: string) => void
 }) {
   const chapter = chapters[book.chapterIndex]
+  const chapterUrl = chapter?.url || ''
+  const canOpenOriginal = /^https?:\/\//i.test(chapterUrl)
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
   const [tocOpen, setTocOpen] = useState(true)
@@ -542,6 +545,18 @@ export const ReaderView = memo(function ReaderView({
             </button>
           </div>
           <div className="actions">
+            <button
+              className="btn ghost"
+              onClick={() => {
+                if (!canOpenOriginal) return
+                void window.fly.openExternal(chapterUrl)
+              }}
+              disabled={!canOpenOriginal}
+              title={canOpenOriginal ? '在浏览器中打开原文' : '当前章节无可用原文链接'}
+            >
+              <IconLink />
+              查看原文
+            </button>
             <button
               className={`btn ghost${settingsOpen ? ' active-setting' : ''}`}
               onClick={() => setSettingsOpen((v) => !v)}

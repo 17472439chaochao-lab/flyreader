@@ -66,10 +66,24 @@ pub async fn fetch_text(url: &str, options: &FetchOptions) -> Result<Page, Strin
     let method = Method::from_bytes(method_name.to_uppercase().as_bytes())
         .map_err(|_| format!("不支持的请求方法：{method_name}"))?;
 
-    let mut builder = client()
-        .request(method.clone(), url)
-        .header("accept", DEFAULT_ACCEPT)
-        .header("accept-language", DEFAULT_ACCEPT_LANGUAGE);
+    let has_accept = options
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("accept"));
+    let has_accept_language = options
+        .headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("accept-language"));
+
+    let mut builder = client().request(method.clone(), url);
+    // 书源若自带 Accept，不再追加默认值，避免与 application/json 拼成双 Accept
+    // （部分站点会因此返回 JSON 字符串化的 HTML）。
+    if !has_accept {
+        builder = builder.header("accept", DEFAULT_ACCEPT);
+    }
+    if !has_accept_language {
+        builder = builder.header("accept-language", DEFAULT_ACCEPT_LANGUAGE);
+    }
     for (k, v) in &options.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
@@ -126,10 +140,25 @@ pub async fn fetch_text(url: &str, options: &FetchOptions) -> Result<Page, Strin
         .clone()
         .filter(|c| !c.trim().is_empty())
         .or_else(|| detect_charset(content_type.as_deref(), &bytes));
+    let text = decode_bytes(&bytes, charset.as_deref().unwrap_or("utf-8"));
     Ok(Page {
-        text: decode_bytes(&bytes, charset.as_deref().unwrap_or("utf-8")),
+        // 部分站点在 Accept 含 application/json 时，把整页 HTML 当成 JSON 字符串返回
+        // （形如 "\"<!DOCTYPE html>...\\/table>\""）。解包后才能走 CSS/XPath 规则。
+        text: maybe_unwrap_json_string(text),
         final_url,
     })
+}
+
+/// 若响应体是 JSON 字符串（非对象/数组），解包为内层文本；否则原样返回。
+fn maybe_unwrap_json_string(text: String) -> String {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('"') {
+        return text;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::String(inner)) if !inner.is_empty() => inner,
+        _ => text,
+    }
 }
 
 /// 从 Content-Type 或 HTML meta 检测字符集，对应 detectCharset。
@@ -380,4 +409,30 @@ fn eval_arithmetic(expr: &str, page: f64) -> Option<String> {
     } else {
         result.to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unwrap_json_stringified_html() {
+        let raw = serde_json::to_string("<table class=\"table\"><tr><td>ok</td></tr></table>").unwrap();
+        let out = maybe_unwrap_json_string(raw);
+        assert!(out.starts_with("<table"), "out={out}");
+        assert!(out.contains("class=\"table\""));
+    }
+
+    #[test]
+    fn leave_json_object_alone() {
+        let raw = r#"{"data":[{"name":"剑来"}]}"#.to_string();
+        let out = maybe_unwrap_json_string(raw.clone());
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn leave_plain_html_alone() {
+        let raw = "<html><body>hi</body></html>".to_string();
+        assert_eq!(maybe_unwrap_json_string(raw.clone()), raw);
+    }
 }

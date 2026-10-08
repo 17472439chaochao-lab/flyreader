@@ -29,7 +29,7 @@ import {
   SearchIcon
 } from '../components/icons'
 import { VirtualList } from '../components/VirtualList'
-import { formatProgressLabel, runWithProgress } from '../utils/progress'
+import { runWithProgress } from '../utils/progress'
 
 /**
  * 书源管理页：搜索/筛选/统计书源，支持文件与 URL 导入、
@@ -65,7 +65,11 @@ export const SourcesView = memo(function SourcesView({
 }) {
   const [testingUrl, setTestingUrl] = useState<string | null>(null)
   const [testingAll, setTestingAll] = useState(false)
-  const [testProgress, setTestProgress] = useState('')
+  const [testProgress, setTestProgress] = useState<{
+    done: number
+    total: number
+    current: string
+  } | null>(null)
   const [editing, setEditing] = useState<BookSource | null>(null)
   const [editName, setEditName] = useState('')
   const [editText, setEditText] = useState('')
@@ -322,11 +326,19 @@ export const SourcesView = memo(function SourcesView({
     const urls = filteredSources.map((s) => s.bookSourceUrl)
     const filterLabel = filterItems.find((f) => f.id === filter)?.label || '当前'
     setTestingAll(true)
-    setTestProgress(`0/${urls.length}`)
+    setTestProgress({ done: 0, total: urls.length, current: '' })
     try {
       const next = await runWithProgress(
         (track) => {
-          track(window.fly.sources.onTestProgress((p) => setTestProgress(formatProgressLabel(p))))
+          track(
+            window.fly.sources.onTestProgress((p) =>
+              setTestProgress({
+                done: p.done,
+                total: p.total,
+                current: p.current || ''
+              })
+            )
+          )
         },
         () => window.fly.sources.testAll(testKeyword, urls)
       )
@@ -339,7 +351,7 @@ export const SourcesView = memo(function SourcesView({
       showToast(`批量测试失败：${(e as Error).message}`)
     } finally {
       setTestingAll(false)
-      setTestProgress('')
+      setTestProgress(null)
     }
   }
 
@@ -568,16 +580,8 @@ export const SourcesView = memo(function SourcesView({
           title="测试当前顶部筛选分类中的书源"
           onClick={() => void onTestCurrent()}
         >
-          {testingAll ? (
-            <>
-              <LoadingIcon /> 测试中 {testProgress}
-            </>
-          ) : (
-            <>
-              <IconTest />
-              测试当前（{filteredSources.length}）
-            </>
-          )}
+          <IconTest />
+          测试当前（{filteredSources.length}）
         </button>
         <button
           className="btn ghost"
@@ -883,6 +887,33 @@ export const SourcesView = memo(function SourcesView({
                 {onlineFetching ? '获取中…' : `获取并导入（${selectedRepoIds.length}）`}
               </button>
             </div>
+          </div>
+        </div>
+      ) : null}
+
+      {testingAll && testProgress ? (
+        <div className="probe-overlay" role="status" aria-live="polite">
+          <div className="test-progress-card">
+            <div className="test-progress-head">
+              <LoadingIcon />
+              <strong>正在测试书源</strong>
+            </div>
+            <div className="search-progress-track">
+              <div
+                className="search-progress-bar"
+                style={{
+                  width: `${
+                    testProgress.total > 0
+                      ? Math.min(100, (testProgress.done / testProgress.total) * 100)
+                      : 0
+                  }%`
+                }}
+              />
+            </div>
+            <p className="test-progress-label">
+              {testProgress.done}/{testProgress.total}
+              {testProgress.current ? ` · ${testProgress.current}` : ''}
+            </p>
           </div>
         </div>
       ) : null}

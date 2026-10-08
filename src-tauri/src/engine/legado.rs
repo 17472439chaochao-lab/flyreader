@@ -256,10 +256,23 @@ pub async fn search_books(source: &Value, key: &str, page: u32) -> Result<Vec<Va
 }
 
 /// JSON 条目原样解析，HTML 片段包一层容器以便嵌套取值（与原版一致）。
+///
+/// 表格行/单元格不能塞进 `<div>`：html5ever 会走 foster parenting，把 `<td>` 挪出
+/// 包裹层，导致 `td a@text` 等子选择器取空。改用 `<table>`（单元格再包一层 `<tr>`）。
 fn wrap_item(item: &str) -> String {
     let trimmed = item.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        item.to_string()
+        return item.to_string();
+    }
+    let head: String = trimmed.chars().take(8).collect::<String>().to_ascii_lowercase();
+    if head.starts_with("<tr")
+        || head.starts_with("<thead")
+        || head.starts_with("<tbody")
+        || head.starts_with("<tfoot")
+    {
+        format!("<table id=\"__wrap__\">{item}</table>")
+    } else if head.starts_with("<td") || head.starts_with("<th") {
+        format!("<table id=\"__wrap__\"><tr>{item}</tr></table>")
     } else {
         format!("<div id=\"__wrap__\">{item}</div>")
     }
@@ -690,6 +703,28 @@ mod tests {
         // init 取不到值时退回原内容，规则为空同样原样返回
         assert_eq!(apply_init_rule(raw, "$.nope", ""), raw);
         assert_eq!(apply_init_rule(raw, "", ""), raw);
+    }
+
+    /// 爱意文学网搜索列表：`table.table tr` → wrap 后 CSS 子选择器须仍能取到字段。
+    #[test]
+    fn table_row_wrap_keeps_css_fields() {
+        let html = r#"<table class="table"><tr><th>书名</th><th>作者</th></tr><tr><td><a href="https://www.aiyiweb.net/item/xxs0Tx.htm" title="剑来杂谈" target="_blank">剑来杂谈</a></td><td class="text-muted">浮生半日不得闲</td></tr></table>"#;
+        let items = get_elements(html, Some("table.table tr"));
+        assert_eq!(items.len(), 2);
+        let wrapped = wrap_item(&items[1]);
+        assert!(
+            wrapped.starts_with("<table"),
+            "tr 片段应包进 table，避免 foster parenting：{wrapped}"
+        );
+        assert_eq!(get_string(&wrapped, Some("td a@text"), ""), "剑来杂谈");
+        assert_eq!(
+            get_string(&wrapped, Some("td.text-muted@text"), ""),
+            "浮生半日不得闲"
+        );
+        assert_eq!(
+            get_string(&wrapped, Some("td a@href"), "https://www.aiyiweb.net"),
+            "https://www.aiyiweb.net/item/xxs0Tx.htm"
+        );
     }
 }
 
