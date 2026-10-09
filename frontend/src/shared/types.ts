@@ -375,7 +375,37 @@ export interface WindowBounds {
 }
 
 /** 主界面视图名 */
-export type ViewName = 'shelf' | 'search' | 'sources' | 'reader' | 'settings' | 'about'
+export type ViewName = 'shelf' | 'search' | 'rank' | 'sources' | 'reader' | 'settings' | 'about'
+
+/** 起点排行频道 */
+export type RankChannel = 'rank' | 'finish'
+
+/** 起点排行子榜（仅 rank 频道） */
+export type RankBoard = 'yuepiao' | 'hotsales' | 'recom' | 'collect'
+
+/** 起点男频 / 女频 */
+export type RankGender = 'male' | 'female'
+
+/** 起点排行单本条目 */
+export interface RankBook {
+  name: string
+  author: string
+  coverUrl?: string | null
+  intro?: string | null
+  category?: string | null
+  status?: string | null
+  rank?: number | null
+  bid?: string | null
+}
+
+/** 起点排行列表结果 */
+export interface RankListResult {
+  books: RankBook[]
+  page: number
+  hasMore: boolean
+  source: 'mobile' | 'mobile_api' | string
+  boardLabel: string
+}
 
 /** 书架排序方式 */
 export type ShelfSort = 'lastRead' | 'added'

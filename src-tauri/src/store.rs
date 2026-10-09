@@ -1024,7 +1024,10 @@ impl Store {
         };
         let last_view = {
             let v = str_or("lastView", "shelf");
-            if matches!(v.as_str(), "search" | "sources" | "settings" | "about" | "shelf") {
+            if matches!(
+                v.as_str(),
+                "search" | "rank" | "sources" | "settings" | "about" | "shelf"
+            ) {
                 v
             } else {
                 "shelf".into()

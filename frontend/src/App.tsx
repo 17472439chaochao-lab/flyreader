@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { filterChangeSourceCandidates, filterRelevantSearchHits, dedupeSearchBooks } from '@shared/searchRelevance'
 import { authorLabel } from '@shared/author'
+import { pickBookAuthor, pickBookName } from '@shared/bookMeta'
 import { isLocalBook } from '@shared/bookLocal'
 import { catalogUpdateKind, countAddedChapters, matchChapterIndex, readableChapters } from '@shared/matchChapter'
 import {
@@ -21,6 +22,7 @@ import { IconClose, LoadingIcon } from './components/icons'
 import { SidebarMotto } from './components/SidebarMotto'
 import { useEyeCareReminder } from './hooks/useEyeCareReminder'
 import { AboutView } from './views/AboutView'
+import { RankView } from './views/RankView'
 import { ReaderView } from './views/ReaderView'
 import { SearchView } from './views/SearchView'
 import { SettingsView } from './views/SettingsView'
@@ -65,6 +67,8 @@ interface ViewCallbacks {
   onClearHistory: () => void
   onRemoveHistory: (k: string) => void
   onRead: (b: SearchBook) => void
+  // RankView
+  onRankOpenBook: (name: string) => void
   // SourcesView
   onTestKeywordChange: (v: string) => void
   onTestKeywordCommit: (v: string) => void
@@ -84,6 +88,8 @@ interface ViewCallbacks {
   onActiveChapter: (i: number) => void
   onSettingsChange: (s: ReaderSettings) => void
   onAddPurify: (text: string) => void
+  /** 强制重新加载当前章节正文（跳过缓存） */
+  onReloadChapter: () => void
 }
 
 /**
@@ -490,8 +496,8 @@ export default function App() {
       const newBook: ShelfBook = {
         ...old,
         id: bookId(candidate.origin, candidate.bookUrl),
-        name: info.name || candidate.name || old.name,
-        author: info.author || candidate.author || old.author,
+        name: pickBookName(info.name, candidate.name, old.name),
+        author: pickBookAuthor(info.author, candidate.author, old.author),
         bookUrl: candidate.bookUrl,
         coverUrl: info.coverUrl || candidate.coverUrl || old.coverUrl,
         intro: info.intro || candidate.intro || old.intro,
@@ -536,8 +542,8 @@ export default function App() {
       const total = readableChapters(list).length
       const updated: ShelfBook = {
         ...book,
-        name: info.name || book.name,
-        author: info.author || book.author,
+        name: pickBookName(info.name, book.name),
+        author: pickBookAuthor(info.author, book.author),
         coverUrl: info.coverUrl || book.coverUrl,
         intro: info.intro || book.intro,
         lastChapter: info.lastChapter || list[list.length - 1]?.title || book.lastChapter,
@@ -749,8 +755,8 @@ export default function App() {
           infoChapters = await window.fly.books.toc(book.origin, tocUrl)
           const updated: ShelfBook = {
             ...withRead,
-            name: info.name || book.name,
-            author: info.author || book.author,
+            name: pickBookName(info.name, book.name),
+            author: pickBookAuthor(info.author, book.author),
             coverUrl: info.coverUrl || book.coverUrl,
             intro: info.intro || book.intro,
             tocUrl,
@@ -850,8 +856,8 @@ export default function App() {
         onStage?.('正在获取书籍详情…')
         const info = await window.fly.books.info(b.origin, b.bookUrl)
         tocUrl = info.tocUrl || b.bookUrl
-        infoName = info.name || b.name
-        infoAuthor = info.author || b.author
+        infoName = pickBookName(info.name, b.name)
+        infoAuthor = pickBookAuthor(info.author, b.author)
         infoCover = info.coverUrl || b.coverUrl
         infoIntro = info.intro || b.intro
         infoLast = info.lastChapter || b.lastChapter
@@ -975,7 +981,7 @@ export default function App() {
     book: ShelfBook,
     index: number,
     list: Chapter[],
-    options?: { resetScroll?: boolean }
+    options?: { resetScroll?: boolean; refresh?: boolean }
   ) {
     const chapter = list[index]
     if (!chapter?.url) {
@@ -983,6 +989,7 @@ export default function App() {
       setLoadingContent(false)
       return
     }
+    const refresh = options?.refresh ?? false
     const resetScroll = options?.resetScroll ?? index !== book.chapterIndex
     const mdDoc =
       (book.localFormat || '').toLowerCase() === 'md' ||
@@ -991,6 +998,7 @@ export default function App() {
 
     // Markdown 全文模式：目录切换只改锚点，正文已在内存则不再重复拉取
     if (
+      !refresh &&
       mdDoc &&
       readingRef.current?.id === book.id &&
       contentRef.current.trim().length > 0 &&
@@ -1014,7 +1022,12 @@ export default function App() {
     const gen = ++chapterLoadGenRef.current
     setLoadingContent(true)
     try {
-      const text = await window.fly.books.content(book.origin, chapter.url, book.id)
+      const text = await window.fly.books.content(
+        book.origin,
+        chapter.url,
+        book.id,
+        refresh
+      )
       if (gen !== chapterLoadGenRef.current) return
       setContent(text || '（正文为空，可能是书源规则不兼容）')
       setReaderCacheTick((n) => n + 1)
@@ -1030,6 +1043,7 @@ export default function App() {
       const next = await window.fly.shelf.upsert(updated)
       if (gen !== chapterLoadGenRef.current) return
       setShelf(next)
+      if (refresh) showToast('已重新加载本章正文')
 
       const preloadN = Math.max(0, prefs.preloadCount ?? 3)
       if (preloadN > 0 && !isLocalBook(book)) {
@@ -1048,7 +1062,12 @@ export default function App() {
       }
     } catch (e) {
       if (gen !== chapterLoadGenRef.current) return
-      setContent(`加载失败：${(e as Error).message}`)
+      if (refresh) {
+        // 刷新失败保留当前正文，只提示错误
+        showToast((e as Error).message || '重新加载失败')
+      } else {
+        setContent(`加载失败：${(e as Error).message}`)
+      }
     } finally {
       if (gen === chapterLoadGenRef.current) {
         setLoadingContent(false)
@@ -1255,6 +1274,13 @@ export default function App() {
     onClearHistory: () => void clearSearchHistory(),
     onRemoveHistory: (k) => void removeSearchHistoryItem(k),
     onRead: (b) => void readSearchBook(b),
+    onRankOpenBook: (name) => {
+      const key = name.trim()
+      if (!key) return
+      setKeyword(key)
+      goView('search')
+      void runSearch(key)
+    },
     onTestKeywordChange: (v) => {
       setPrefs((p) => ({ ...p, sourceTestKeyword: v }))
     },
@@ -1304,6 +1330,18 @@ export default function App() {
       const next = await window.fly.settings.addPurify(text)
       setSettings(next)
       showToast(`已加入净化：${text.slice(0, 24)}${text.length > 24 ? '…' : ''}`)
+    },
+    onReloadChapter: () => {
+      if (!reading) return
+      if (isLocalBook(reading)) {
+        showToast('本地书籍无需重新加载')
+        return
+      }
+      if (loadingContent) return
+      void loadChapter(reading, reading.chapterIndex, chapters, {
+        resetScroll: false,
+        refresh: true
+      })
     }
   }
 
@@ -1332,6 +1370,13 @@ export default function App() {
       onClearHistory: () => viewCbRef.current!.onClearHistory(),
       onRemoveHistory: (k) => viewCbRef.current!.onRemoveHistory(k),
       onRead: (b) => void viewCbRef.current!.onRead(b)
+    }),
+    []
+  )
+
+  const rankCb = useMemo<Pick<ViewCallbacks, 'onRankOpenBook'>>(
+    () => ({
+      onRankOpenBook: (name) => viewCbRef.current!.onRankOpenBook(name)
     }),
     []
   )
@@ -1371,6 +1416,7 @@ export default function App() {
       | 'onActiveChapter'
       | 'onSettingsChange'
       | 'onAddPurify'
+      | 'onReloadChapter'
     >
   >(
     () => ({
@@ -1381,7 +1427,8 @@ export default function App() {
       onScrollSave: (t) => viewCbRef.current!.onScrollSave(t),
       onActiveChapter: (i) => viewCbRef.current!.onActiveChapter(i),
       onSettingsChange: (s) => viewCbRef.current!.onSettingsChange(s),
-      onAddPurify: (t) => void viewCbRef.current!.onAddPurify(t)
+      onAddPurify: (t) => void viewCbRef.current!.onAddPurify(t),
+      onReloadChapter: () => viewCbRef.current!.onReloadChapter()
     }),
     []
   )
@@ -1417,6 +1464,7 @@ export default function App() {
           onActiveChapter={readerCb.onActiveChapter}
           onSettingsChange={readerCb.onSettingsChange}
           onAddPurify={readerCb.onAddPurify}
+          onReloadChapter={readerCb.onReloadChapter}
         />
         {toastStack}
         {confirmOverlay}
@@ -1436,6 +1484,7 @@ export default function App() {
             [
               ['shelf', '书架'],
               ['search', '搜书'],
+              ['rank', '排行'],
               ['sources', '书源'],
               ['settings', '设置'],
               ['about', '关于']
@@ -1493,6 +1542,7 @@ export default function App() {
               onRead={searchCb.onRead}
             />
           )}
+          {view === 'rank' && <RankView onOpenBook={rankCb.onRankOpenBook} />}
           {view === 'sources' && (
             <SourcesView
               sources={sources}

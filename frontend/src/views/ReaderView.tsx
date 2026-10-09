@@ -1,5 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { authorName } from '@shared/author'
+import { isLocalBook } from '@shared/bookLocal'
 import { applyPurify } from '@shared/purify'
 import { ensureNovelParagraphs } from '@shared/novelText'
 import { cssFontFamily, platformDefaultFontFamily, primaryFontFamily } from '@shared/fonts'
@@ -14,6 +15,7 @@ import {
   IconLink,
   IconNext,
   IconPrev,
+  IconRefresh,
   IconToc,
   IconTocClose
 } from '../components/icons'
@@ -75,7 +77,7 @@ function detectActiveMdChapter(
 
 /**
  * 阅读页：侧栏虚拟目录、正文滚动与进度持久化、
- * 主题/字体设置、自动滚屏，以及选中文字加入净化。
+ * 主题/字体设置、自动滚屏、重新加载本章，以及选中文字加入净化。
  */
 export const ReaderView = memo(function ReaderView({
   book,
@@ -91,7 +93,8 @@ export const ReaderView = memo(function ReaderView({
   onScrollSave,
   onActiveChapter,
   onSettingsChange,
-  onAddPurify
+  onAddPurify,
+  onReloadChapter
 }: {
   book: ShelfBook
   chapters: Chapter[]
@@ -107,10 +110,12 @@ export const ReaderView = memo(function ReaderView({
   onActiveChapter: (i: number) => void
   onSettingsChange: (s: ReaderSettings) => void
   onAddPurify: (text: string) => void
+  onReloadChapter: () => void
 }) {
   const chapter = chapters[book.chapterIndex]
   const chapterUrl = chapter?.url || ''
   const canOpenOriginal = /^https?:\/\//i.test(chapterUrl)
+  const canReloadChapter = !isLocalBook(book) && !isMdBook(book)
   const [menu, setMenu] = useState<{ x: number; y: number; text: string } | null>(null)
   const menuRef = useRef<HTMLDivElement | null>(null)
   const [tocOpen, setTocOpen] = useState(true)
@@ -557,6 +562,17 @@ export const ReaderView = memo(function ReaderView({
               <IconLink />
               查看原文
             </button>
+            {canReloadChapter ? (
+              <button
+                className="btn ghost"
+                onClick={() => onReloadChapter()}
+                disabled={loading}
+                title="跳过缓存，重新加载当前章节正文"
+              >
+                <IconRefresh />
+                重新加载
+              </button>
+            ) : null}
             <button
               className={`btn ghost${settingsOpen ? ' active-setting' : ''}`}
               onClick={() => setSettingsOpen((v) => !v)}
@@ -683,6 +699,10 @@ export const ReaderView = memo(function ReaderView({
             if (autoScrollingRef.current) setAutoScrolling(false)
             else if (settingsOpen) setSettingsOpen(false)
           }}
+          onContextMenu={(e) => {
+            // 屏蔽 WebView 原生右键菜单（Reload / Inspect Element）
+            e.preventDefault()
+          }}
           onDoubleClick={(e) => {
             e.preventDefault()
             window.getSelection()?.removeAllRanges()
@@ -754,10 +774,10 @@ export const ReaderView = memo(function ReaderView({
                 }
               }}
               onContextMenu={(e) => {
+                e.preventDefault()
                 if (autoScrollingRef.current) setAutoScrolling(false)
                 const text = window.getSelection()?.toString().trim() || ''
                 if (!text) return
-                e.preventDefault()
                 setMenu({ x: e.clientX, y: e.clientY, text })
               }}
               dangerouslySetInnerHTML={{ __html: mdHtml }}
@@ -774,10 +794,10 @@ export const ReaderView = memo(function ReaderView({
                 } as CSSProperties
               }
               onContextMenu={(e) => {
+                e.preventDefault()
                 if (autoScrollingRef.current) setAutoScrolling(false)
                 const text = window.getSelection()?.toString().trim() || ''
                 if (!text) return
-                e.preventDefault()
                 setMenu({ x: e.clientX, y: e.clientY, text })
               }}
             >
@@ -812,7 +832,10 @@ export const ReaderView = memo(function ReaderView({
             <IconFilter />
             加入净化
           </button>
-          <div className="ctx-preview">{menu.text.slice(0, 40)}{menu.text.length > 40 ? '…' : ''}</div>
+          <div className="ctx-preview">
+            {menu.text.slice(0, 40)}
+            {menu.text.length > 40 ? '…' : ''}
+          </div>
         </div>
       ) : null}
     </div>

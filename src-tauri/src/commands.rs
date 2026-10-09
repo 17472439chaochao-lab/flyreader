@@ -13,6 +13,9 @@ use crate::engine::legado::{
     get_book_info, get_chapter_list, get_content, is_source_structural_ok, normalize_sources,
     search_books, test_source,
 };
+use crate::engine::qidian_rank::{
+    fetch_rank_list, list_result_to_value, RankBoard, RankChannel, RankGender,
+};
 use crate::engine::source_repo::{OnlineRepoRequest, SourceRepoMeta, BUILTIN_REPOS};
 use crate::engine::text::ensure_novel_paragraphs;
 use crate::store::{blend_match_score, is_local_book, now_ms, ChapterRow, Store};
@@ -746,6 +749,19 @@ fn match_chapter_index(prev: &Value, chapters: &[Value]) -> usize {
     prev_index.min(chapters.len() - 1)
 }
 
+/// 详情规则取空时引擎会填「未知书名 / 佚名」；合并时不要用占位符盖掉书架已有真名。
+fn should_apply_info_field(key: &str, info_value: &str, book: &Value) -> bool {
+    if info_value.is_empty() {
+        return false;
+    }
+    let existing = str_of(book, key);
+    match key {
+        "name" if info_value == "未知书名" => existing.is_empty() || existing == "未知书名",
+        "author" if info_value == "佚名" => existing.is_empty() || existing == "佚名",
+        _ => true,
+    }
+}
+
 /// 合并书籍信息与目录：只覆盖非空元信息，其余保留书架原值（原版 info.x || book.x）。
 fn merge_book_info(
     book: &Value,
@@ -760,7 +776,7 @@ fn merge_book_info(
     };
     for key in ["name", "author", "coverUrl", "intro", "lastChapter"] {
         let value = str_of(info, key);
-        if !value.is_empty() {
+        if should_apply_info_field(key, value, book) {
             obj.insert(key.to_string(), json!(value));
         }
     }
@@ -1630,43 +1646,57 @@ async fn books_content(
     origin: String,
     chapter_url: String,
     book_id: Option<String>,
+    // refresh=true：跳过本地缓存，强制按书源重新抓取并覆盖写入
+    refresh: Option<bool>,
 ) -> Result<String, String> {
-    let cached = state
-        .0
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get_chapter_content(book_id.as_deref(), &chapter_url);
-    if let Some(cached) = cached {
-        let marked_local = book_id
-            .as_deref()
-            .map(|id| {
-                state
-                    .0
-                    .lock()
-                    .map(|s| s.is_markdown_local(id))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if marked_local || looks_like_markdown(&cached) {
-            return Ok(cached);
-        }
-        let normalized = ensure_novel_paragraphs(&cached);
-        if !normalized.is_empty() && normalized != cached {
-            if let Some(id) = book_id.as_deref() {
-                state
-                    .0
-                    .lock()
-                    .map_err(|e| e.to_string())?
-                    .set_chapter_content(id, &chapter_url, &normalized, None, None);
+    let refresh = refresh.unwrap_or(false);
+
+    if !refresh {
+        let cached = state
+            .0
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get_chapter_content(book_id.as_deref(), &chapter_url);
+        if let Some(cached) = cached {
+            let marked_local = book_id
+                .as_deref()
+                .map(|id| {
+                    state
+                        .0
+                        .lock()
+                        .map(|s| s.is_markdown_local(id))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if marked_local || looks_like_markdown(&cached) {
+                return Ok(cached);
             }
+            let normalized = ensure_novel_paragraphs(&cached);
+            if !normalized.is_empty() && normalized != cached {
+                if let Some(id) = book_id.as_deref() {
+                    state
+                        .0
+                        .lock()
+                        .map_err(|e| e.to_string())?
+                        .set_chapter_content(id, &chapter_url, &normalized, None, None);
+                }
+            }
+            return Ok(normalized);
         }
-        return Ok(normalized);
     }
 
     if origin == "local" || chapter_url.starts_with("local://") {
-        return Err("本地章节内容缺失，请重新打开本地文件".to_string());
+        return Err(if refresh {
+            "本地书籍无法重新加载".to_string()
+        } else {
+            "本地章节内容缺失，请重新打开本地文件".to_string()
+        });
     }
-    let source = source_of(&state, &origin).ok_or("书源不存在或网络不可用，且本地无缓存")?;
+    let source = source_of(&state, &origin).ok_or(if refresh {
+        "书源不存在，无法重新加载".to_string()
+    } else {
+        "书源不存在或网络不可用，且本地无缓存".to_string()
+    })?;
     match get_content(&source, &chapter_url).await {
         Ok(content) => {
             if !content.is_empty() {
@@ -1680,12 +1710,17 @@ async fn books_content(
             Ok(content)
         }
         Err(e) => {
+            if refresh {
+                // 强制刷新失败时保留原缓存，不把失败页写进正文
+                return Err(format!("重新加载失败：{e}"));
+            }
             // 网络失败时退回任何一书按 URL 命中的缓存，并把它归到当前书
-            let fallback = state
-                .0
-                .lock()
-                .map_err(|e| e.to_string())?
-                .get_chapter_content(None, &chapter_url);
+            let fallback = {
+                let store = state.0.lock().map_err(|e| e.to_string())?;
+                store
+                    .get_chapter_content(book_id.as_deref(), &chapter_url)
+                    .or_else(|| store.get_chapter_content(None, &chapter_url))
+            };
             match fallback {
                 Some(text) => {
                     if let Some(id) = book_id.as_deref() {
@@ -1875,6 +1910,32 @@ impl ProgressEmitter {
 }
 
 const PROGRESS_THROTTLE_MS: u64 = 150;
+
+// ---------- 起点移动站排行 / 完本 ----------
+
+/// 拉取起点排行或完本列表（仅移动站；HTML → majax）。
+#[tauri::command]
+async fn rank_qidian_list(
+    channel: String,
+    board: Option<String>,
+    gender: Option<String>,
+    page: Option<u32>,
+    cat_id: Option<i64>,
+) -> Result<Value, String> {
+    let channel = RankChannel::parse(&channel)?;
+    let board = match channel {
+        RankChannel::Rank => {
+            let raw = board.unwrap_or_else(|| "yuepiao".into());
+            Some(RankBoard::parse(&raw)?)
+        }
+        RankChannel::Finish => None,
+    };
+    let gender = RankGender::parse(gender.as_deref().unwrap_or("male"))?;
+    let page = page.unwrap_or(1).max(1);
+    let cat_id = cat_id.unwrap_or(-1);
+    let result = fetch_rank_list(channel, board, gender, page, cat_id).await?;
+    Ok(list_result_to_value(result))
+}
 
 // ---------- 多书源并发搜索 ----------
 
@@ -2210,7 +2271,8 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             books_cached_urls,
             books_preload,
             books_cancel_preload,
-            books_search
+            books_search,
+            rank_qidian_list
         ])
 }
 
@@ -2277,6 +2339,22 @@ mod tests {
         let kept = merge_book_info(&book, &info, "", &chapters, None);
         assert!(kept.get("chapterIndex").is_none());
         assert_eq!(kept["tocUrl"], json!("old"));
+    }
+
+    #[test]
+    fn merge_book_info_skips_placeholder_name_and_author() {
+        let book = json!({ "name": "都市凡人双修传", "author": "天羽凤凰" });
+        let info = json!({ "name": "未知书名", "author": "佚名", "lastChapter": "第1章" });
+        let chapters = vec![ch("u1", "第一章", 0)];
+        let merged = merge_book_info(&book, &info, "", &chapters, None);
+        assert_eq!(merged["name"], json!("都市凡人双修传"));
+        assert_eq!(merged["author"], json!("天羽凤凰"));
+        assert_eq!(merged["lastChapter"], json!("第1章"));
+        // 书架本身已是占位时，允许详情占位写回（无更差）
+        let blank = json!({ "name": "未知书名", "author": "佚名" });
+        let filled = merge_book_info(&blank, &info, "", &chapters, None);
+        assert_eq!(filled["name"], json!("未知书名"));
+        assert_eq!(filled["author"], json!("佚名"));
     }
 
     #[test]

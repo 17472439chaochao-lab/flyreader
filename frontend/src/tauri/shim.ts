@@ -10,6 +10,10 @@ import type {
   Chapter,
   OnlineFetchProgress,
   OnlineRepoRequest,
+  RankBoard,
+  RankChannel,
+  RankGender,
+  RankListResult,
   ReaderSettings,
   SearchBook,
   SearchProgress,
@@ -120,8 +124,13 @@ export const fly = {
     info: (origin: string, bookUrl: string) =>
       invoke<BookInfo>('books_info', { origin, bookUrl }),
     toc: (origin: string, tocUrl: string) => invoke<Chapter[]>('books_toc', { origin, tocUrl }),
-    content: (origin: string, chapterUrl: string, bookId?: string) =>
-      invoke<string>('books_content', { origin, chapterUrl, bookId }),
+    content: (origin: string, chapterUrl: string, bookId?: string, refresh?: boolean) =>
+      invoke<string>('books_content', {
+        origin,
+        chapterUrl,
+        bookId,
+        refresh: refresh ?? false
+      }),
     cachedUrls: (bookId: string) => invoke<string[]>('books_cached_urls', { bookId }),
     preload: (origin: string, bookId: string, chapterUrls: string[]) =>
       invoke<string[]>('books_preload', { origin, bookId, chapterUrls }),
@@ -171,6 +180,17 @@ export const fly = {
   data: {
     legacyStatus: () => invoke<LegacyDataStatus>('data_legacy_status'),
     importLegacy: () => invoke<LegacyImportResult>('data_import_legacy')
+  },
+  /** 起点移动站排行 / 完本 */
+  rank: {
+    qidianList: (args: {
+      channel: RankChannel
+      board?: RankBoard
+      gender?: RankGender
+      page?: number
+      /** 起点分类 ID；-1 表示全站 */
+      catId?: number
+    }) => invoke<RankListResult>('rank_qidian_list', args)
   },
   /** 老板键显隐事件：由 Rust 侧全局快捷键回调推送 */
   onBossVisibility: (cb: (payload: { hidden: boolean }) => void) =>

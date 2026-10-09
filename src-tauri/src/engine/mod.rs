@@ -4,6 +4,7 @@
 pub mod http;
 pub mod js;
 pub mod legado;
+pub mod qidian_rank;
 pub mod rules;
 pub mod source_repo;
 pub mod text;

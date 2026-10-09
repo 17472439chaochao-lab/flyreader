@@ -271,11 +271,14 @@ fn own_text(el: &ElementRef) -> String {
 }
 
 /// 按 getType 从元素取值，对应 getFromCheerio。
+///
+/// `@content` 取 HTML `content` 属性（常见于 `meta[property=og:novel:book_name]@content`），
+/// 不是正文文本；无该属性时再退回 textContent。
 fn get_from_element(el: &ElementRef, get_type: &str, base_url: &str) -> String {
     let ty = get_type.to_lowercase();
     match ty.as_str() {
         "html" => el.inner_html(),
-        "text" | "textnodes" | "content" => collapse_whitespace(&element_text(el)),
+        "text" | "textnodes" => collapse_whitespace(&element_text(el)),
         "owntext" => own_text(el),
         "href" => {
             let href = el.attr("href").or_else(|| el.attr("data-href")).unwrap_or("");
@@ -290,6 +293,7 @@ fn get_from_element(el: &ElementRef, get_type: &str, base_url: &str) -> String {
             absolute_url(base_url, src)
         }
         "all" => el.html(),
+        // `content` 与任意其它 @attr：先取同名属性（Legado 语义）
         other => {
             if let Some(attr) = el.attr(other) {
                 if other.contains("href") || other.contains("src") || other.contains("url") {
@@ -302,15 +306,30 @@ fn get_from_element(el: &ElementRef, get_type: &str, base_url: &str) -> String {
     }
 }
 
+/// cheerio 允许 `meta[property=og:novel:book_name]`；scraper 要求属性值加引号，否则整段选择器编译失败。
+fn quote_unquoted_attr_values(selector: &str) -> String {
+    let Some(re) = get_regex(r#"\[([^=\]]+?)([~|^$*]?=)\s*([^\]"'\s][^\]"]*)\]"#, "") else {
+        return selector.to_string();
+    };
+    re.replace_all(selector, |caps: &regex::Captures| {
+        let name = caps[1].trim();
+        let op = &caps[2];
+        let val = caps[3].trim();
+        format!(r#"[{name}{op}"{val}"]"#)
+    })
+    .into_owned()
+}
+
 /// Legado 的 `id.x` / `class.x` 语法转 CSS 选择器。
 fn to_css_selector(selector: &str) -> String {
-    if let Some(rest) = selector.strip_prefix("id.") {
+    let base = if let Some(rest) = selector.strip_prefix("id.") {
         format!("#{rest}")
     } else if let Some(rest) = selector.strip_prefix("class.") {
         format!(".{rest}")
     } else {
         selector.to_string()
-    }
+    };
+    quote_unquoted_attr_values(&base)
 }
 
 /// 末尾 `.N` 索引（支持 -1 倒数），对应 selectByCss 的 index 处理。
@@ -917,5 +936,44 @@ mod tests {
         let frag = r#"<p id="p">正文<span>忽略</span></p>"#;
         assert_eq!(get_string(frag, Some("#p@ownText"), ""), "正文");
         assert_eq!(get_string(frag, Some("#p@text"), ""), "正文忽略");
+    }
+
+    /// 爱意文学网等书源：未加引号的 og:novel 属性选择器 + `@content` 取 content 属性。
+    #[test]
+    fn meta_og_novel_content_attr() {
+        let html = r#"<html><head>
+<meta property="og:novel:book_name" content="都市凡人双修传">
+<meta property="og:novel:author" content="天羽凤凰">
+<meta property="og:novel:latest_chapter_name" content="第1007章 三界修士投诚">
+</head><body><h1>都市凡人双修传</h1></body></html>"#;
+        assert_eq!(
+            to_css_selector("meta[property=og:novel:book_name]"),
+            r#"meta[property="og:novel:book_name"]"#
+        );
+        assert_eq!(
+            get_string(html, Some("meta[property=og:novel:book_name]@content"), ""),
+            "都市凡人双修传"
+        );
+        assert_eq!(
+            get_string(html, Some("meta[property=og:novel:author]@content"), ""),
+            "天羽凤凰"
+        );
+        assert_eq!(
+            get_string(
+                html,
+                Some("meta[property=og:novel:latest_chapter_name]@content"),
+                ""
+            ),
+            "第1007章 三界修士投诚"
+        );
+        // 已加引号的写法保持兼容
+        assert_eq!(
+            get_string(
+                html,
+                Some(r#"meta[property="og:novel:book_name"]@content"#),
+                ""
+            ),
+            "都市凡人双修传"
+        );
     }
 }
