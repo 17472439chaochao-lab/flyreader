@@ -8,10 +8,11 @@
   "scripts": {
     "dev:fe": "vite",
     "build:fe": "tsc --noEmit -p tsconfig.json && vite build",
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build",
-    "icons": "tauri icon src-tauri/app-icon.png"
+    "tauri": "node scripts/tauri-cli.mjs",
+    "dev": "node scripts/tauri-cli.mjs dev",
+    "build": "node scripts/tauri-cli.mjs build",
+    "build:win": "node scripts/tauri-cli.mjs build --bundles nsis",
+    "icons": "node scripts/tauri-cli.mjs icon src-tauri/app-icon.png"
   },
   "dependencies": {
     "@mantine/core": "^8.3.18",

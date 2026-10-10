@@ -36,7 +36,7 @@
     "license": "MIT",
     "shortDescription": "轻量小说阅读器",
     "longDescription": "轻量小说阅读器，支持本地 TXT/EPUB/Markdown、在线搜索阅读与导出，兼容 Legado 书源",
-    "targets": ["dmg", "nsis", "msi", "appimage", "deb"],
+    "targets": ["dmg", "nsis", "appimage", "deb"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

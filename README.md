@@ -89,6 +89,7 @@ cargo test --lib update_check::tests::live -- --ignored --nocapture  # Gitee 发
 
 ```bash
 npm run build                 # tauri build：先 npm run build:fe，再按 tauri.conf.json 打包
+npm run build:win             # Windows：只打 NSIS 安装包（不依赖 WiX / MSI）
 npx tauri build --bundles app,dmg   # macOS：同时保留 .app 目录，调试更快
 npm run icons                 # 由 src-tauri/app-icon.png 重新生成全套图标
 ```
@@ -100,7 +101,7 @@ npm run icons                 # 由 src-tauri/app-icon.png 重新生成全套图
 | `.app` | `src-tauri/target/release/bundle/macos/FlyReader.app` | 10.9 MB |
 | `.dmg` | `src-tauri/target/release/bundle/dmg/FlyReader_1.1.0_x64.dmg` | 5.28 MB |
 
-- **Windows / Linux 建议在对应平台打包**：`bundle.targets` 里列了 `nsis`/`msi`/`appimage`/`deb`，但在 macOS 上会被静默跳过；macOS 也没有 `zip` 目标，`--bundles` 只接受 `app`/`dmg`。
+- **Windows / Linux 建议在对应平台打包**：`bundle.targets` 为 `nsis`/`appimage`/`deb`（Windows 默认只打 NSIS，避免 WiX/MSI 额外依赖）；在 macOS 上非 Apple 目标会被静默跳过，`--bundles` 只接受 `app`/`dmg`。必须在含 `src-tauri/tauri.conf.json` 的仓库根目录执行 `npm run build`。
 - **未签名**：当前配置与旧版一致地不做代码签名，本机可直接运行；但从网上下载的副本会带 quarantine 属性，需要在「隐私与安全性」里允许打开，彻底解决需要 Developer ID 证书 + 公证。
 - 图标源文件是 `src-tauri/app-icon.png`（1024×1024）。`npm run icons` 会覆写 `src-tauri/icons/icon.png`，**不要**拿它当输入源，否则每次生成都会被降采样。
 
