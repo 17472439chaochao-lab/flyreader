@@ -15,12 +15,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building FlyReader");
 
-    app.run(|app_handle, event| match event {
+    app.run(|_app_handle, event| match event {
         #[cfg(target_os = "macos")]
         tauri::RunEvent::Reopen {
             has_visible_windows, ..
         } => {
-            crate::boss_key::on_reopen(app_handle, has_visible_windows);
+            crate::boss_key::on_reopen(_app_handle, has_visible_windows);
         }
         _ => {}
     });

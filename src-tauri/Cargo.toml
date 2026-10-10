@@ -46,7 +46,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 # 体积优先（原版 Electron 包 ~108MB，目标是十 MB 级）
 [profile.release]
 codegen-units = 1
-lto = "fat"
+lto = "thin"
+# 刻意保留 opt-level="s"；fat LTO 在 Windows 上链接耗时长，thin 足够快
 opt-level = "s"
 strip = true
 # 刻意不设 panic = "abort"：本地书解析跑在 spawn_blocking 里，

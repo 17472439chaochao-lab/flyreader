@@ -104,6 +104,7 @@ pub fn register_from_prefs(app: &AppHandle, prefs: &Value) -> Value {
 
 /// 原版 `app.on('activate')`：Dock 图标点击时，若窗口正被老板键隐藏则恢复显示。
 /// 回调本身跑在主线程，可以安全调用 `toggle`。
+#[cfg(target_os = "macos")]
 pub fn on_reopen(app: &AppHandle, has_visible_windows: bool) {
     if has_visible_windows {
         return;
