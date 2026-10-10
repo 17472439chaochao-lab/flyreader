@@ -21,11 +21,9 @@ if (!existsSync(cli)) {
   process.exit(1)
 }
 
-const env = {
-  ...process.env,
-  TAURI_APP_PATH: tauriDir,
-  TAURI_FRONTEND_PATH: root
-}
+const env = { ...process.env }
+delete env.TAURI_APP_PATH
+delete env.TAURI_FRONTEND_PATH
 
 const child = spawn(process.execPath, [cli, ...process.argv.slice(2)], {
   cwd: root,

@@ -7,7 +7,7 @@
   "type": "module",
   "scripts": {
     "dev:fe": "vite",
-    "build:fe": "tsc --noEmit -p tsconfig.json && vite build",
+    "build:fe": "node scripts/build-fe.mjs",
     "tauri": "node scripts/tauri-cli.mjs",
     "dev": "node scripts/tauri-cli.mjs dev",
     "build": "node scripts/tauri-cli.mjs build",

@@ -4,9 +4,15 @@
   "version": "1.1.0",
   "identifier": "com.flyreader.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev:fe",
+    "beforeDevCommand": {
+      "script": "npm run dev:fe",
+      "cwd": ".."
+    },
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "npm run build:fe",
+    "beforeBuildCommand": {
+      "script": "npm run build:fe",
+      "cwd": ".."
+    },
     "frontendDist": "../frontend/dist"
   },
   "app": {
@@ -19,6 +25,7 @@
         "minWidth": 860,
         "minHeight": 560,
         "resizable": true,
+        "shadow": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "trafficLightPosition": { "x": 16, "y": 16 }

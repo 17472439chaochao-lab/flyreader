@@ -198,6 +198,9 @@ A: 该组合键已被其他应用注册。换一个组合，或在设置里关�
 **Q: 标题栏拖不动窗口？**
 A: WKWebView 不支持旧版的 `-webkit-app-region: drag`，本版本在侧栏、顶栏、目录面板头部与阅读工具条上改用 `data-tauri-drag-region` 标注（并开放 `core:window:allow-start-dragging` 权限）。若在自定义界面里新增可拖拽区域，照这个写法加。
 
+**Q: Windows 为什么没有「文件 / 编辑 / 查看」菜单栏？**
+A: 刻意去掉了。原生菜单栏会占一整行，观感与 macOS 沉浸式顶栏不一致；Windows / Linux 改为无边框窗口 + 右上角自定义按钮，重载 / 缩放快捷键（Ctrl+R、Ctrl+0/=/-）仍可用。
+
 **Q: 书架/设置突然是空的？**
 A: 数据固定在 `Application Support/com.flyreader.desktop`。旧版数据在 `fly-novel/`，新版只读继承；若目录被改动，可在设置页「旧版数据」面板重新合并。
 

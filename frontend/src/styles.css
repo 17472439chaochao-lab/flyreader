@@ -43,13 +43,65 @@ html.theme-paper {
   color-scheme: light;
 }
 
-/* titleBarStyle / hiddenTitle / trafficLightPosition 只在 macOS 生效，
-   Windows 与 Linux 仍是原生标题栏，空带和红绿灯留白要一并归零。 */
+/* Windows / Linux：无边框自定义顶栏，左侧不必给红绿灯让位，右侧给窗口按钮留空。 */
 html[data-os='windows'],
 html[data-os='linux'] {
-  --titlebar: 0px;
+  --titlebar: 40px;
   --traffic-inset: 20px;
   --traffic-inset-edge: 20px;
+  --caption-inset: 138px;
+}
+
+.win-controls {
+  position: fixed;
+  top: 0;
+  right: 0;
+  z-index: 10000;
+  display: none;
+  height: var(--titlebar);
+  align-items: stretch;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+html[data-os='windows'] .win-controls,
+html[data-os='linux'] .win-controls {
+  display: flex;
+}
+
+.win-ctl {
+  width: 46px;
+  height: 100%;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.win-ctl:hover {
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  color: var(--ink);
+}
+
+.win-ctl-close:hover {
+  background: #e81123;
+  color: #fff;
+}
+
+html[data-os='windows'] .reader-toolbar,
+html[data-os='linux'] .reader-toolbar {
+  padding-right: var(--caption-inset);
+}
+
+html[data-os='windows'] .topbar,
+html[data-os='linux'] .topbar {
+  margin-right: var(--caption-inset);
 }
 
 html.theme-green {

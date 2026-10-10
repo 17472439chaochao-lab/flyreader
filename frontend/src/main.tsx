@@ -10,7 +10,7 @@ import './styles.css'
 
 window.fly = fly
 
-// 沉浸式标题栏只存在于 macOS；提前在首帧前打标记，让 CSS 归零原生标题栏下多余的空带。
+// 提前打 OS 标记：macOS 用原生 Overlay 红绿灯；Windows/Linux 用自定义无边框顶栏。
 const os = /Mac|iPhone|iPad/.test(navigator.userAgent)
   ? 'macos'
   : /Windows/.test(navigator.userAgent)

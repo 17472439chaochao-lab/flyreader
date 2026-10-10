@@ -46,6 +46,18 @@ async fn app_check_update(app: AppHandle) -> Result<Value, String> {
     Ok(crate::update_check::check_gitee_update(&app_get_version(app)).await)
 }
 
+/// 非 macOS 无原生菜单时，前端快捷键走这里调缩放。
+#[tauri::command]
+fn app_apply_zoom(app: AppHandle, action: String) -> Result<Value, String> {
+    let id = match action.as_str() {
+        "reset" => crate::app_menu::ID_ZOOM_RESET,
+        "in" => crate::app_menu::ID_ZOOM_IN,
+        "out" => crate::app_menu::ID_ZOOM_OUT,
+        _ => return Err("未知缩放动作".into()),
+    };
+    Ok(json!({ "zoom": crate::app_menu::apply_zoom(&app, id) }))
+}
+
 #[tauri::command]
 async fn app_open_external(url: String) -> Result<Value, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -2202,6 +2214,11 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             app.manage(crate::app_menu::ZoomState::default());
             let handle = app.handle().clone();
             crate::app_menu::build(&handle).map_err(|e| e.to_string())?;
+            // Windows / Linux：关掉原生标题栏与菜单栏，走前端自定义顶栏（对齐 macOS Overlay）
+            #[cfg(any(windows, target_os = "linux"))]
+            if let Some(win) = handle.get_webview_window("main") {
+                let _ = win.set_decorations(false);
+            }
             crate::theme::apply_app_theme(&handle, &settings);
             // 老板键注册要离开主线程，否则 macOS 上会等自己阻塞（见 boss_key 模块注释）
             tauri::async_runtime::spawn(async move {
@@ -2241,6 +2258,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             app_get_state,
             app_get_version,
             app_check_update,
+            app_apply_zoom,
             app_open_external,
             settings_get,
             settings_save,

@@ -21,6 +21,7 @@ import {
 import { ConfirmDialog, type ConfirmOutcome, type ConfirmRequest } from './components/ConfirmDialog'
 import { ChangeSourceDialog } from './components/ChangeSourceDialog'
 import { SidebarMotto } from './components/SidebarMotto'
+import { WindowChrome } from './components/WindowChrome'
 import { useEyeCareReminder } from './hooks/useEyeCareReminder'
 import { AboutView } from './views/AboutView'
 import { RankView } from './views/RankView'
@@ -1372,6 +1373,7 @@ export default function App() {
   if (view === 'reader' && reading) {
     return (
       <>
+        <WindowChrome />
         <ReaderView
           book={reading}
           chapters={chapters}
@@ -1397,6 +1399,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <WindowChrome />
       <aside className="sidebar" data-tauri-drag-region="deep">
         <div className="brand">
           <h1>FlyReader</h1>
@@ -1431,7 +1434,17 @@ export default function App() {
       </aside>
 
       <section className="main">
-        <div className="topbar" aria-hidden="true" data-tauri-drag-region="" />
+        <div
+          className="topbar"
+          aria-hidden="true"
+          data-tauri-drag-region=""
+          onDoubleClick={() => {
+            if (document.documentElement.dataset.os === 'macos') return
+            void import('@tauri-apps/api/window').then(({ getCurrentWindow }) =>
+              getCurrentWindow().toggleMaximize()
+            )
+          }}
+        />
         <div className="content">
           {view === 'shelf' && (
             <ShelfView
