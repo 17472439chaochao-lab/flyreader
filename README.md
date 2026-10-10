@@ -14,6 +14,12 @@
 - **仓库：** https://gitee.com/wucc513721/flyreader
 - **许可证：** MIT（开源）
 
+## 运行界面
+
+| Windows · 书架 | macOS · 排行 |
+| --- | --- |
+| ![Windows 书架界面](docs/screenshots/shelf-windows.jpg) | ![macOS 排行界面](docs/screenshots/rank-macos.jpg) |
+
 ## 功能概览
 
 - 导入 Legado 书源（本地文件 / URL 订阅），支持按当前筛选导出 JSON；**一键在线获取**社区书源仓库并自动导入（内置 tickmao / XIU2 / yckceo，支持自定义订阅 URL）
