@@ -10,7 +10,7 @@ use serde_json::{json, Map, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
 use crate::engine::http::{fetch_text, FetchOptions};
 use crate::engine::legado::{
-    get_book_info, get_chapter_list, get_content, is_source_structural_ok, normalize_sources,
+    get_book_info, get_chapter_list_with_budget, get_content, is_source_structural_ok, normalize_sources,
     search_books, test_source,
 };
 use crate::engine::qidian_rank::{
@@ -682,6 +682,8 @@ const APP_EXPORT_REPO: &str = "https://gitee.com/wucc513721/flyreader";
 /// 书籍信息 / 目录接口的时间预算（原版 15000 / 20000 ms）。
 const INFO_BUDGET_SECS: u64 = 15;
 const TOC_BUDGET_SECS: u64 = 20;
+/// 目录分页单页预算：换源时避免单页卡死拖长整体等待
+const TOC_PAGE_BUDGET_SECS: u64 = 8;
 /// 导出时补抓缺章的预算（原版 15000 ms，比整本缓存的 12s 宽松）。
 const EXPORT_CHAPTER_BUDGET_SECS: u64 = 15;
 
@@ -816,7 +818,7 @@ async fn fetch_info_and_toc(
     .to_string();
     let chapters = tokio::time::timeout(
         Duration::from_secs(TOC_BUDGET_SECS),
-        get_chapter_list(source, &toc_url),
+        get_chapter_list_with_budget(source, &toc_url, Some(Duration::from_secs(TOC_PAGE_BUDGET_SECS))),
     )
     .await
     .map_err(|_| toc_timeout.to_string())??;
@@ -1627,7 +1629,12 @@ async fn books_info(
     book_url: String,
 ) -> Result<Value, String> {
     let source = source_of(&state, &origin).ok_or("书源不存在")?;
-    get_book_info(&source, &book_url).await
+    tokio::time::timeout(
+        Duration::from_secs(INFO_BUDGET_SECS),
+        get_book_info(&source, &book_url),
+    )
+    .await
+    .map_err(|_| format!("获取详情超时（{INFO_BUDGET_SECS}s）：{book_url}"))?
 }
 
 #[tauri::command]
@@ -1637,7 +1644,12 @@ async fn books_toc(
     toc_url: String,
 ) -> Result<Vec<Value>, String> {
     let source = source_of(&state, &origin).ok_or("书源不存在")?;
-    get_chapter_list(&source, &toc_url).await
+    tokio::time::timeout(
+        Duration::from_secs(TOC_BUDGET_SECS),
+        get_chapter_list_with_budget(&source, &toc_url, Some(Duration::from_secs(TOC_PAGE_BUDGET_SECS))),
+    )
+    .await
+    .map_err(|_| format!("获取目录超时（{TOC_BUDGET_SECS}s）：{toc_url}"))?
 }
 
 #[tauri::command]

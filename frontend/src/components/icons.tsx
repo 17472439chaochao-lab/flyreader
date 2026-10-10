@@ -87,13 +87,24 @@ export function IconSwap() {
   )
 }
 
-/** 导入图标 */
+/** 导入图标：文件夹 + 加号，表示「从本地打开文件」，避免与下载/导出混淆 */
 export function IconImport() {
   return (
     <svg className="icon" width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d="M12 3v10" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
-      <path d="M8 9l4 4 4-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M5 17v2h14v-2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <path
+        d="M3 7V5.5A1.5 1.5 0 014.5 4h4l2 2h5.5A1.5 1.5 0 0117.5 7.5V8"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M3 7l1.2 10.5A2 2 0 006.18 19h8.42a2 2 0 002-1.6L20 8H3z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+      <path d="M12 11v4m-2-2h4" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   )
 }

@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react'
+import { Button, Select } from '@mantine/core'
 import { authorLabel, authorName } from '@shared/author'
 import { isLocalBook } from '@shared/bookLocal'
 import type { ShelfBook, ShelfSort } from '@shared/types'
@@ -7,11 +8,11 @@ import { VirtualList } from '../components/VirtualList'
 import {
   IconDownload,
   IconExport,
+  IconImport,
   IconRefresh,
   IconStop,
   IconSwap,
   IconTrash,
-  LoadingIcon,
   SearchIcon
 } from '../components/icons'
 import { cacheLabel } from '../utils/cacheLabel'
@@ -84,33 +85,37 @@ export const ShelfView = memo(function ShelfView({
         </div>
         <div className="panel-actions">
           {shelf.length ? (
-            <label className="shelf-sort">
+            <div className="shelf-sort">
               <span className="shelf-sort-label">排序</span>
-              <select
-                value={sort}
-                onChange={(e) => onSortChange(e.target.value as ShelfSort)}
+              <Select
+                size="xs"
+                w={112}
                 aria-label="书架排序"
-              >
-                <option value="lastRead">最近阅读</option>
-                <option value="added">加入时间</option>
-              </select>
-            </label>
+                value={sort}
+                onChange={(value) => value && onSortChange(value as ShelfSort)}
+                data={[
+                  { value: 'lastRead', label: '最近阅读' },
+                  { value: 'added', label: '加入时间' }
+                ]}
+              />
+            </div>
           ) : null}
-          <button className="btn ghost" onClick={onImportLocal}>
+          <Button size="sm" variant="default" leftSection={<IconImport />} onClick={onImportLocal}>
             打开本地书
-          </button>
-          <button
-            className="btn ghost"
+          </Button>
+          <Button
+            size="sm"
+            variant="default"
             disabled={!onlineCount || updatingAll}
+            loading={updatingAll}
+            leftSection={<IconRefresh />}
             onClick={onUpdateAll}
           >
-            {updatingAll ? <LoadingIcon /> : <IconRefresh />}
             {updatingAll ? `更新中 ${updateProgress}` : '全部更新'}
-          </button>
-          <button className="btn" onClick={onSearch}>
-            <SearchIcon />
+          </Button>
+          <Button size="sm" leftSection={<SearchIcon />} onClick={onSearch}>
             去搜书
-          </button>
+          </Button>
         </div>
       </div>
       {!shelf.length ? (
@@ -166,54 +171,65 @@ export const ShelfView = memo(function ShelfView({
                   {!local ? (
                     <>
                       {caching ? (
-                        <button className="btn ghost" onClick={() => onCancelCache(b.id)}>
-                          <IconStop />
+                        <Button
+                          size="compact-sm"
+                          variant="default"
+                          leftSection={<IconStop />}
+                          onClick={() => onCancelCache(b.id)}
+                        >
                           取消缓存
-                        </button>
+                        </Button>
                       ) : (
-                        <button
-                          className="btn ghost"
+                        <Button
+                          size="compact-sm"
+                          variant="default"
                           disabled={locked}
+                          leftSection={<IconDownload />}
                           onClick={() => onCache(b)}
                         >
-                          <IconDownload />
                           {b.cache?.status === 'full' ? '重新缓存' : '缓存'}
-                        </button>
+                        </Button>
                       )}
-                      <button
-                        className="btn ghost"
+                      <Button
+                        size="compact-sm"
+                        variant="default"
                         disabled={locked || caching}
+                        leftSection={<IconExport />}
                         onClick={() => onExportTxt(b)}
                       >
-                        <IconExport />
                         导出TXT
-                      </button>
-                      <button
-                        className="btn ghost"
+                      </Button>
+                      <Button
+                        size="compact-sm"
+                        variant="default"
                         disabled={locked || caching}
+                        loading={busy}
+                        leftSection={<IconRefresh />}
                         onClick={() => onUpdate(b)}
                       >
-                        {busy ? <LoadingIcon /> : <IconRefresh />}
                         {busy ? '更新中' : '更新'}
-                      </button>
-                      <button
-                        className="btn ghost"
+                      </Button>
+                      <Button
+                        size="compact-sm"
+                        variant="default"
                         disabled={locked || caching}
+                        leftSection={<IconSwap />}
                         onClick={() => onChangeSource(b)}
                       >
-                        <IconSwap />
                         换源
-                      </button>
+                      </Button>
                     </>
                   ) : null}
-                  <button
-                    className="btn ghost"
+                  <Button
+                    size="compact-sm"
+                    variant="light"
+                    color="danger"
                     disabled={locked || caching}
+                    leftSection={<IconTrash />}
                     onClick={() => onRemove(b.id)}
                   >
-                    <IconTrash />
                     移除
-                  </button>
+                  </Button>
                 </div>
               </div>
             )

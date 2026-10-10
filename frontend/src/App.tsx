@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Button, Loader, Modal, Notification, Text, useMantineColorScheme } from '@mantine/core'
 import { filterChangeSourceCandidates, filterRelevantSearchHits, dedupeSearchBooks } from '@shared/searchRelevance'
 import { authorLabel } from '@shared/author'
 import { pickBookAuthor, pickBookName } from '@shared/bookMeta'
@@ -18,7 +19,7 @@ import {
   type ViewName
 } from '@shared/types'
 import { ConfirmDialog, type ConfirmOutcome, type ConfirmRequest } from './components/ConfirmDialog'
-import { IconClose, LoadingIcon } from './components/icons'
+import { ChangeSourceDialog } from './components/ChangeSourceDialog'
 import { SidebarMotto } from './components/SidebarMotto'
 import { useEyeCareReminder } from './hooks/useEyeCareReminder'
 import { AboutView } from './views/AboutView'
@@ -130,18 +131,24 @@ export default function App() {
   const [cacheProgressMap, setCacheProgressMap] = useState<Record<string, string>>({})
   const pendingExportsRef = useRef<Map<string, string>>(new Map())
   const [readerCacheTick, setReaderCacheTick] = useState(0)
-  const [changeSource, setChangeSource] = useState<{
-    book: ShelfBook
-    searching: boolean
-    applying: boolean
-    candidates: SearchBook[]
-    progress: SearchProgress | null
-  } | null>(null)
-  const changeSourceGenRef = useRef(0)
+  /** 换源对话框：只保留要换哪本书 + 应用结果后的关闭标记 */
+  const [changeSource, setChangeSource] = useState<ShelfBook | null>(null)
+
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
 
   // 最新视图回调镜像：每次渲染刷新，供下方稳定包装读取，避免闭包陈旧与全树重渲染
   const viewCbRef = useRef<ViewCallbacks | null>(null)
+
+  /** 安全提取错误文案：Tauri invoke 抛出的值未必是标准 Error，message 可能缺失 */
+  const errMsg = useCallback((e: unknown, fallback: string): string => {
+    if (e instanceof Error && e.message) return e.message
+    if (typeof e === 'string' && e.trim()) return e
+    if (e && typeof e === 'object') {
+      const m = (e as { message?: unknown }).message
+      if (typeof m === 'string' && m.trim()) return m
+    }
+    return fallback
+  }, [])
 
   /** 显示短暂 Toast 提示（约 2.8 秒后自动消失；多条并发时依次堆叠互不覆盖） */
   const showToast = useCallback((msg: string) => {
@@ -202,11 +209,14 @@ export default function App() {
     }
   }, [])
 
+  const { setColorScheme } = useMantineColorScheme()
+
   useEffect(() => {
     const theme = settings.theme || 'paper'
     document.documentElement.classList.remove('theme-paper', 'theme-green', 'theme-night')
     document.documentElement.classList.add(`theme-${theme}`)
-  }, [settings.theme])
+    setColorScheme(theme === 'night' ? 'dark' : 'light')
+  }, [settings.theme, setColorScheme])
 
   /** 从后端重取全量状态（首屏与旧版数据导入后共用） */
   async function reloadAllState() {
@@ -401,17 +411,10 @@ export default function App() {
   }
 
   /**
-   * 确认后删除单条搜索历史
+   * 直接删除单条搜索历史（无需确认）
    * @param keyword 要删除的关键词
    */
   async function removeSearchHistoryItem(keyword: string) {
-    const result = await askConfirm({
-      title: '删除搜索记录',
-      message: `确定删除搜索历史「${keyword}」？`,
-      confirmText: '删除',
-      danger: true
-    })
-    if (result !== 'confirm') return
     setSearchHistory(await window.fly.books.removeHistory(keyword))
   }
 
@@ -616,10 +619,10 @@ export default function App() {
   }
 
   /**
-   * 打开换源对话框并搜索同名其他书源
+   * 打开换源对话框（对话框内部完成搜索与候选展示；这里只负责挂起/收起面板）
    * @param book 当前书架书籍
    */
-  async function openChangeSource(book: ShelfBook) {
+  function openChangeSource(book: ShelfBook) {
     if (isLocalBook(book)) {
       showToast('本地书籍不支持换源')
       return
@@ -629,106 +632,26 @@ export default function App() {
       goView('sources')
       return
     }
-    const gen = ++changeSourceGenRef.current
-    setChangeSource({
-      book,
-      searching: true,
-      applying: false,
-      candidates: [],
-      progress: { done: 0, total: enabledCount, found: 0, current: '', phase: 'start' }
-    })
-
-    /** 将中间搜索命中合并进换源候选列表（去重且排除当前源） */
-    const mergeHits = (books: SearchBook[]) => {
-      const filtered = filterChangeSourceCandidates(book, books).filter(
-        (b) => !(b.origin === book.origin && b.bookUrl === book.bookUrl)
-      )
-      if (!filtered.length) return
-      setChangeSource((prev) => {
-        if (!prev || prev.book.id !== book.id || gen !== changeSourceGenRef.current) return prev
-        const seen = new Set(prev.candidates.map((c) => `${c.origin}::${c.bookUrl}`))
-        const next = prev.candidates.slice()
-        for (const b of filtered) {
-          const id = `${b.origin}::${b.bookUrl}`
-          if (seen.has(id)) continue
-          seen.add(id)
-          next.push(b)
-        }
-        return { ...prev, candidates: next }
-      })
-    }
-
-    try {
-      const { books } = await runWithProgress(
-        (track) => {
-          track(
-            window.fly.books.onSearchProgress((p) => {
-              if (gen !== changeSourceGenRef.current) return
-              setChangeSource((prev) =>
-                prev && prev.book.id === book.id ? { ...prev, progress: p } : prev
-              )
-            })
-          )
-          track(
-            window.fly.books.onSearchPartial((books) => {
-              if (gen !== changeSourceGenRef.current) return
-              mergeHits(books)
-            })
-          )
-        },
-        () => window.fly.books.search(book.name)
-      )
-      if (gen !== changeSourceGenRef.current) return
-      const candidates = filterChangeSourceCandidates(book, books).filter(
-        (b) => !(b.origin === book.origin && b.bookUrl === book.bookUrl)
-      )
-      setChangeSource({
-        book,
-        searching: false,
-        applying: false,
-        candidates,
-        progress: null
-      })
-      if (!candidates.length) showToast('未找到可换的其他书源')
-    } catch (e) {
-      if (gen !== changeSourceGenRef.current) return
-      setChangeSource(null)
-      showToast(`换源搜索失败：${(e as Error).message}`)
-    }
+    setChangeSource(book)
   }
 
-  /**
-   * 将换源对话框中选中的候选应用到书架
-   * @param candidate 选中的搜索命中
-   */
+  /** 对话框选中候选后：替换书架条目并关闭面板 */
   async function applyChangeSource(candidate: SearchBook) {
-    if (!changeSource || changeSource.applying) return
-    const old = changeSource.book
-    changeSourceGenRef.current += 1
-    setChangeSource({
-      ...changeSource,
-      searching: false,
-      applying: true,
-      progress: null
-    })
+    if (!changeSource) return
+    const old = changeSource
     try {
       await replaceShelfWithSearchBook(old, candidate)
       setChangeSource(null)
       showToast(`已换源到「${candidate.originName}」`)
     } catch (e) {
-      setChangeSource((prev) =>
-        prev
-          ? { ...prev, searching: false, applying: false, progress: null }
-          : null
-      )
-      showToast(`换源失败：${(e as Error).message}`)
+      const msg = errMsg(e, '网络或书源异常')
+      showToast(`换源失败：${msg}`)
+      throw new Error(msg)
     }
   }
 
-  /** 关闭换源对话框（换源进行中时忽略） */
+  /** 关闭换源对话框 */
   function closeChangeSource() {
-    if (changeSource?.applying) return
-    changeSourceGenRef.current += 1
     setChangeSource(null)
   }
 
@@ -1436,9 +1359,9 @@ export default function App() {
   const toastStack = toasts.length ? (
     <div className="toast-stack" role="status" aria-live="polite">
       {toasts.map((t) => (
-        <div key={t.id} className="toast">
+        <Notification key={t.id} withCloseButton={false} color="accent" className="toast-note">
           {t.text}
-        </div>
+        </Notification>
       ))}
     </div>
   ) : null
@@ -1474,7 +1397,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <aside className="sidebar" data-tauri-drag-region="">
+      <aside className="sidebar" data-tauri-drag-region="deep">
         <div className="brand">
           <h1>FlyReader</h1>
           <p>轻量阅读 · Legado 书源</p>
@@ -1490,13 +1413,18 @@ export default function App() {
               ['about', '关于']
             ] as const
           ).map(([id, label]) => (
-            <button
+            <Button
               key={id}
-              className={view === id ? 'active' : ''}
+              className="nav-item"
+              mod={{ active: view === id }}
+              variant="subtle"
+              radius="md"
+              size="sm"
+              justify="flex-start"
               onClick={() => goView(id)}
             >
               {label}
-            </button>
+            </Button>
           ))}
         </nav>
         <SidebarMotto />
@@ -1583,77 +1511,17 @@ export default function App() {
         </div>
       ) : null}
       {changeSource ? (
-        <div
-          className="modal-backdrop"
-          onClick={() => closeChangeSource()}
-        >
-          <div className="modal change-source-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-head">
-              <h3>换源 · {changeSource.book.name}</h3>
-              <button
-                className="btn ghost icon-btn"
-                title="关闭"
-                aria-label="关闭"
-                disabled={changeSource.applying}
-                onClick={() => closeChangeSource()}
-              >
-                <IconClose />
-              </button>
-            </div>
-            <p className="muted" style={{ margin: 0 }}>
-              当前：{changeSource.book.originName}
-            </p>
-            {changeSource.searching ? (
-              <div className="change-source-status" role="status" aria-live="polite">
-                <LoadingIcon />
-                <span>
-                  {changeSource.progress && changeSource.progress.total > 0
-                    ? `正在搜索书源 ${changeSource.progress.done}/${changeSource.progress.total}`
-                    : '正在搜索书源…'}
-                  {changeSource.candidates.length
-                    ? ` · 已找到 ${changeSource.candidates.length} 个，可先选择`
-                    : ' · 有结果会立即显示'}
-                  {changeSource.progress?.current
-                    ? ` · ${changeSource.progress.current}`
-                    : ''}
-                </span>
-              </div>
-            ) : null}
-            {changeSource.applying ? (
-              <div className="loading">
-                <LoadingIcon /> 正在换源…
-              </div>
-            ) : changeSource.candidates.length ? (
-              <div className="change-source-list">
-                {changeSource.candidates.map((c) => (
-                  <button
-                    key={`${c.origin}-${c.bookUrl}`}
-                    className="change-source-item"
-                    onClick={() => void applyChangeSource(c)}
-                  >
-                    {c.coverUrl ? (
-                      <img className="cover" src={c.coverUrl} alt="" />
-                    ) : (
-                      <div className="cover placeholder">{c.name.slice(0, 1)}</div>
-                    )}
-                    <div className="change-source-meta">
-                      <strong>{c.name}</strong>
-                      <span>{authorLabel(c.author)}</span>
-                      <span>书源：{c.originName || '未知'}</span>
-                      <span className="muted">
-                        最新：{c.lastChapter?.trim() || '暂无'}
-                      </span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            ) : changeSource.searching ? (
-              <div className="empty">正在从各书源查找…</div>
-            ) : (
-              <div className="empty">没有找到其他书源</div>
-            )}
-          </div>
-        </div>
+        <ChangeSourceDialog
+          book={changeSource}
+          sourceCount={enabledCount}
+          filterCandidates={(book, hits) =>
+            filterChangeSourceCandidates(book, hits).filter(
+              (b) => !(b.origin === book.origin && b.bookUrl === book.bookUrl)
+            )
+          }
+          apply={(c) => applyChangeSource(c)}
+          onClose={closeChangeSource}
+        />
       ) : null}
     </div>
   )

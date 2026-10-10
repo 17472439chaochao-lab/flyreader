@@ -1,7 +1,8 @@
+import { Button, Progress, Text, TextInput } from '@mantine/core'
 import { memo } from 'react'
 import { authorLabel } from '@shared/author'
 import type { SearchBook, SearchProgress } from '@shared/types'
-import { IconClose, IconTrash, LoadingIcon, SearchIcon } from '../components/icons'
+import { IconClose, IconTrash, SearchIcon } from '../components/icons'
 import { VirtualList } from '../components/VirtualList'
 
 /**
@@ -58,29 +59,40 @@ export const SearchView = memo(function SearchView({
           </div>
         </div>
         <div className="search-row">
-          <input
+          <TextInput
             value={keyword}
             placeholder="输入书名或作者"
             disabled={searching}
-            onChange={(e) => setKeyword(e.target.value)}
+            size="sm"
+            style={{ flex: 1, minWidth: 0 }}
+            onChange={(e) => setKeyword(e.currentTarget.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') onSearch()
             }}
           />
-          <button className="btn search-btn" disabled={searching} onClick={onSearch}>
-            {searching ? <LoadingIcon /> : <SearchIcon />}
+          <Button
+            size="sm"
+            className="search-btn"
+            loading={searching}
+            disabled={searching}
+            leftSection={searching ? undefined : <SearchIcon />}
+            onClick={onSearch}
+          >
             {searching ? '搜索中' : '搜索'}
-          </button>
+          </Button>
         </div>
         {searching ? (
           <div className="search-progress" role="status" aria-live="polite">
-            <div className="search-progress-track">
-              <div
-                className={`search-progress-bar ${progress && progress.total ? '' : 'indeterminate'}`}
-                style={{ width: `${percent}%` }}
-              />
-            </div>
-            <p>{statusText}</p>
+            {progress && progress.total > 0 ? (
+              <Progress value={percent} size="sm" radius="999px" />
+            ) : (
+              <div className="search-progress-track">
+                <div className="search-progress-bar indeterminate" />
+              </div>
+            )}
+            <Text size="xs" c="dimmed" mt={8}>
+              {statusText}
+            </Text>
           </div>
         ) : null}
       </div>
@@ -90,15 +102,15 @@ export const SearchView = memo(function SearchView({
           <div className="search-history">
             <div className="search-history-head">
               <span>搜索历史</span>
-              <button
-                type="button"
-                className="text-action"
+              <Button
+                variant="subtle"
+                size="compact-xs"
                 disabled={searching}
+                leftSection={<IconTrash />}
                 onClick={onClearHistory}
               >
-                <IconTrash />
                 清空
-              </button>
+              </Button>
             </div>
             <div className="search-history-tags">
               {history.map((item) => (

@@ -349,6 +349,15 @@ pub async fn get_book_info(source: &Value, book_url: &str) -> Result<Value, Stri
 
 /// 抓取目录（支持 nextTocUrl 分页，最多 30 页），对应 getChapterList。
 pub async fn get_chapter_list(source: &Value, toc_url: &str) -> Result<Vec<Value>, String> {
+    get_chapter_list_with_budget(source, toc_url, None).await
+}
+
+/// 抓取目录，`per_page_budget` 给每次分页请求加超时（整体由调用方按总预算控制）。
+pub async fn get_chapter_list_with_budget(
+    source: &Value,
+    toc_url: &str,
+    per_page_budget: Option<std::time::Duration>,
+) -> Result<Vec<Value>, String> {
     let headers = parse_header(str_field(source, &["header"]));
     let chapter_list_rule = str_field(source, &["ruleToc", "chapterList"]).unwrap_or("");
     if chapter_list_rule.is_empty() {
@@ -369,7 +378,13 @@ pub async fn get_chapter_list(source: &Value, toc_url: &str) -> Result<Vec<Value
             headers: headers.clone(),
             ..Default::default()
         };
-        let fetched = fetch_text(&url, &options).await?;
+        let fut = fetch_text(&url, &options);
+        let fetched = match per_page_budget {
+            Some(budget) => tokio::time::timeout(budget, fut)
+                .await
+                .map_err(|_| format!("请求超时：{url}"))?,
+            None => fut.await,
+        }?;
         let base = fetched.final_url.clone();
         let text = fetched.text;
 

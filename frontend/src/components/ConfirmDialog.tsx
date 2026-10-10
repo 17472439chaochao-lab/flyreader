@@ -1,3 +1,5 @@
+import { Button, Group, Modal, Text } from '@mantine/core'
+
 /** 确认对话框关闭时的结果：确认 / 取消 / 额外操作 */
 export type ConfirmOutcome = 'confirm' | 'cancel' | 'extra'
 
@@ -21,40 +23,39 @@ export type ConfirmDialogProps = {
 
 /**
  * 通用确认对话框：支持确认、取消，以及可选的第三操作按钮。
- * 点击遮罩视为取消；危险操作时主按钮使用 danger 样式。
+ * 点击遮罩与 Esc 均视为取消；危险操作时主按钮使用 danger 配色。
  */
 export function ConfirmDialog({ request, onClose }: ConfirmDialogProps) {
   return (
-    <div className="modal-backdrop confirm-backdrop" onClick={() => onClose('cancel')}>
-      <div
-        className={`confirm-dialog ${request.danger ? 'is-danger' : ''}`}
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="confirm-title"
-        aria-describedby="confirm-desc"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h3 id="confirm-title">{request.title}</h3>
-        <p id="confirm-desc">{request.message}</p>
-        <div className="confirm-actions">
-          <button type="button" className="confirm-btn ghost" onClick={() => onClose('cancel')}>
-            {request.cancelText || '取消'}
-          </button>
-          {request.extraText ? (
-            <button type="button" className="confirm-btn ghost" onClick={() => onClose('extra')}>
-              {request.extraText}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className={`confirm-btn primary ${request.danger ? 'danger' : ''}`}
-            autoFocus
-            onClick={() => onClose('confirm')}
-          >
-            {request.confirmText || '确定'}
-          </button>
-        </div>
-      </div>
-    </div>
+    <Modal
+      opened
+      centered
+      size="sm"
+      withCloseButton={false}
+      title={request.title}
+      onClose={() => onClose('cancel')}
+    >
+      <Text size="sm" c="dimmed" style={{ whiteSpace: 'pre-wrap' }}>
+        {request.message}
+      </Text>
+      <Group justify="flex-end" mt="md">
+        <Button variant="default" size="sm" onClick={() => onClose('cancel')}>
+          {request.cancelText || '取消'}
+        </Button>
+        {request.extraText ? (
+          <Button variant="default" size="sm" onClick={() => onClose('extra')}>
+            {request.extraText}
+          </Button>
+        ) : null}
+        <Button
+          size="sm"
+          color={request.danger ? 'danger' : 'accent'}
+          autoFocus
+          onClick={() => onClose('confirm')}
+        >
+          {request.confirmText || '确定'}
+        </Button>
+      </Group>
+    </Modal>
   )
 }

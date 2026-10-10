@@ -1,3 +1,8 @@
+/* 标题衬线栈：与主题无关，单独放 :root，样式表和 Mantine 的 headings 都取这一处。 */
+:root {
+  --font-serif: "Iowan Old Style", "Songti SC", "Noto Serif SC", serif;
+}
+
 :root,
 html.theme-paper {
   --bg: #e6ebe4;
@@ -27,11 +32,24 @@ html.theme-paper {
   --badge-local-fg: #5a3d1a;
   --badge-local-bg: rgba(160, 110, 50, 0.16);
   --sidebar: 220px;
+  /* macOS 走 Overlay 沉浸式标题栏：--titlebar 是给原生红绿灯让位的空带高度。 */
   --titlebar: 52px;
+  /* reader 工具栏左内边距：目录展开时是视觉缩进，折叠后工具栏贴窗口左缘需多让 6px 避开红绿灯。 */
+  --traffic-inset: 72px;
+  --traffic-inset-edge: 78px;
   color: var(--ink);
   background: var(--bg);
   font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", sans-serif;
   color-scheme: light;
+}
+
+/* titleBarStyle / hiddenTitle / trafficLightPosition 只在 macOS 生效，
+   Windows 与 Linux 仍是原生标题栏，空带和红绿灯留白要一并归零。 */
+html[data-os='windows'],
+html[data-os='linux'] {
+  --titlebar: 0px;
+  --traffic-inset: 20px;
+  --traffic-inset-edge: 20px;
 }
 
 html.theme-green {
@@ -128,17 +146,15 @@ button {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  -webkit-app-region: drag;
 }
 
 .brand {
-  -webkit-app-region: no-drag;
   padding: 8px 10px 18px;
 }
 
 .brand h1 {
   margin: 0;
-  font-family: "Iowan Old Style", "Songti SC", "Noto Serif SC", serif;
+  font-family: var(--font-serif);
   font-size: 28px;
   letter-spacing: 0.04em;
   font-weight: 600;
@@ -151,40 +167,43 @@ button {
 }
 
 .nav {
-  -webkit-app-region: no-drag;
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.nav button {
-  text-align: left;
-  padding: 10px 12px;
-  border-radius: 10px;
+/* 导航项用 Mantine Button（真实 button 元素：可键盘操作，也才会被拖拽脚本判定为可点击而避让），
+   配色沿用 app 的导航语义：静默墨色 / 悬停浮面 / 选中主色浅底 */
+.nav-item {
   color: var(--ink-muted);
-  transition: background 160ms ease, color 160ms ease, transform 160ms ease;
+  font-size: 13px;
+  font-weight: 400;
+  padding-inline: 12px;
 }
 
-.nav button:hover {
+.nav-item:hover {
   background: var(--surface);
   color: var(--ink);
 }
 
-.nav button.active {
+.nav-item[data-active] {
   background: var(--accent-soft);
   color: var(--accent);
   font-weight: 600;
 }
 
+.nav-item[data-active]:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
 .sidebar-motto {
-  -webkit-app-region: no-drag;
   margin-top: auto;
   padding: 12px 10px 4px;
 }
 
 .sidebar-motto p {
   margin: 0;
-  font-family: "Iowan Old Style", "Songti SC", "Noto Serif SC", serif;
+  font-family: var(--font-serif);
   font-size: 12px;
   line-height: 1.55;
   color: var(--ink-muted);
@@ -204,7 +223,6 @@ button {
 .topbar {
   height: var(--titlebar);
   flex-shrink: 0;
-  -webkit-app-region: drag;
   border-bottom: 1px solid transparent;
 }
 
@@ -262,26 +280,105 @@ button {
   max-width: none;
 }
 
-.shelf-actions .btn {
-  padding: 7px 10px;
-  font-size: 12px;
-  white-space: nowrap;
-}
-
 .shelf-row .book-item {
   min-width: 0;
   flex: 1;
 }
 
-.change-source-modal {
-  width: min(560px, 100%);
+
+
+/* 换源对话框（独立组件，固定尺寸面板）：面板在三个阶段尺寸完全一致，只换内容，
+   彻底避免 Mantine Modal 内容高度变化引起的竖向跳动。 */
+.csd-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 310;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  backdrop-filter: blur(2px);
 }
 
-.change-source-status {
+.csd-panel {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  border-radius: 14px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 40px color-mix(in srgb, var(--ink) 16%, transparent);
+  overflow: hidden;
+}
+
+.csd-head {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+.csd-title {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.csd-title strong {
+  font-size: 16px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.csd-title span {
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.csd-close {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  font-size: 16px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  background: transparent;
+}
+
+.csd-close:hover {
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+  color: var(--ink);
+}
+
+.csd-close:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.csd-body {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.csd-status {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 4px 0 2px;
   padding: 8px 10px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
@@ -290,21 +387,24 @@ button {
   line-height: 1.4;
 }
 
-.change-source-status svg {
+.csd-status svg {
   flex-shrink: 0;
 }
 
-.change-source-list {
-  overflow: auto;
-  max-height: 50vh;
+.csd-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  padding-right: 2px;
 }
 
-.change-source-item {
+.csd-row {
+  flex-shrink: 0;
   display: flex;
-  flex-direction: row;
   align-items: flex-start;
   gap: 12px;
   padding: 10px 12px;
@@ -316,17 +416,29 @@ button {
   cursor: pointer;
 }
 
-.change-source-item:hover {
+.csd-row:hover {
   border-color: color-mix(in srgb, var(--accent) 35%, transparent);
   background: var(--surface-strong);
 }
 
-.change-source-item .cover {
+.csd-cover {
+  flex-shrink: 0;
   width: 52px;
   height: 70px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: linear-gradient(145deg, #c5d2cc, #9eb4ab);
 }
 
-.change-source-meta {
+.csd-cover.placeholder {
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-family: var(--font-serif);
+  font-size: 22px;
+}
+
+.csd-meta {
   min-width: 0;
   flex: 1;
   display: flex;
@@ -334,7 +446,7 @@ button {
   gap: 2px;
 }
 
-.change-source-item strong {
+.csd-meta strong {
   font-size: 14px;
   line-height: 1.35;
   overflow: hidden;
@@ -342,7 +454,7 @@ button {
   white-space: nowrap;
 }
 
-.change-source-meta span {
+.csd-meta span {
   font-size: 12px;
   color: var(--ink-muted);
   line-height: 1.45;
@@ -351,13 +463,51 @@ button {
   white-space: nowrap;
 }
 
+.csd-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  color: var(--ink-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.csd-applying {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--ink-muted);
+  font-size: 14px;
+}
+
+.csd-applying p {
+  margin: 0;
+  font-size: 12px;
+}
+
+.csd-error {
+  color: var(--danger);
+}
+
+.csd-foot {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
 .content {
   flex: 1;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
   padding: 8px 28px 28px;
-  -webkit-app-region: no-drag;
   overscroll-behavior: contain;
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -434,61 +584,16 @@ button {
 
 .rank-filters {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 10px;
 }
 
-.rank-seg {
-  display: inline-flex;
-  align-items: center;
-  padding: 3px;
-  border-radius: 10px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  gap: 2px;
-}
-
-.rank-seg button {
-  appearance: none;
-  margin: 0;
-  border: 0;
-  background: transparent;
-  color: var(--ink-muted);
-  font: inherit;
-  font-size: 13px;
-  line-height: 1;
-  padding: 7px 12px;
-  border-radius: 7px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: background 140ms ease, color 140ms ease;
-}
-
-.rank-seg button:hover {
-  color: var(--ink);
-  background: color-mix(in srgb, var(--surface-strong) 70%, transparent);
-}
-
-.rank-seg button.active {
-  background: var(--surface-strong);
-  color: var(--accent);
-  font-weight: 600;
-  box-shadow: 0 1px 2px rgba(26, 36, 32, 0.06);
-}
-
-.rank-seg button:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
-  outline-offset: 1px;
-}
-
-.rank-seg-wrap {
+.rank-filters-row {
+  display: flex;
   flex-wrap: wrap;
-  width: 100%;
-}
-
-.rank-seg-wrap button {
-  padding: 6px 10px;
+  align-items: center;
+  gap: 8px 18px;
 }
 
 .rank-page-body {
@@ -568,31 +673,9 @@ button {
   white-space: nowrap;
 }
 
-.shelf-sort select {
-  appearance: none;
-  -webkit-appearance: none;
-  height: 32px;
-  padding: 0 28px 0 10px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--surface-strong)
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none'%3E%3Cpath d='M6 9l6 6 6-6' stroke='%23666' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
-    no-repeat right 8px center;
-  color: var(--ink);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.shelf-sort select:hover,
-.shelf-sort select:focus {
-  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
-  outline: none;
-}
-
 .panel-head h2 {
   margin: 0;
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 26px;
   font-weight: 600;
 }
@@ -604,14 +687,14 @@ button {
 }
 
 .btn {
-  -webkit-app-region: no-drag;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   padding: 8px 14px;
   border: 1px solid transparent;
-  border-radius: 999px;
+  /* 与 Mantine 控件的 radius.sm 同形，避免迁移期两种圆角混在一起 */
+  border-radius: 8px;
   background: var(--accent);
   color: #f5fffc;
   font-size: 13px;
@@ -657,7 +740,6 @@ button {
   margin-bottom: 18px;
 }
 
-.search-row input,
 .field input:not([type='range']),
 .field select {
   width: 100%;
@@ -669,7 +751,6 @@ button {
   outline: none;
 }
 
-.search-row input:focus,
 .field input:not([type='range']):focus,
 .field select:focus {
   border-color: var(--accent);
@@ -698,7 +779,6 @@ button {
 
 .search-btn {
   min-width: 96px;
-  justify-content: center;
   white-space: nowrap;
 }
 
@@ -724,14 +804,14 @@ button {
 .search-progress-track {
   height: 6px;
   border-radius: 999px;
-  background: rgba(26, 36, 32, 0.08);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
   overflow: hidden;
 }
 
 .search-progress-bar {
   height: 100%;
   border-radius: 999px;
-  background: linear-gradient(90deg, #0d6b63, #1a9a8c);
+  background: var(--accent);
   transition: width 220ms ease;
 }
 
@@ -747,12 +827,6 @@ button {
   100% {
     transform: translateX(320%);
   }
-}
-
-.search-progress p {
-  margin: 8px 0 0;
-  font-size: 12px;
-  color: var(--ink-muted);
 }
 
 .book-grid {
@@ -787,40 +861,6 @@ button {
   height: 76px;
 }
 
-
-.text-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 0;
-  border: none;
-  background: none;
-  color: var(--ink-muted);
-  font-size: 12px;
-  white-space: nowrap;
-  border-radius: 0;
-  transition: color 140ms ease;
-}
-
-.text-action:hover {
-  color: var(--ink);
-  transform: none;
-}
-
-.text-action.primary {
-  color: var(--accent);
-  font-weight: 600;
-}
-
-.text-action.primary:hover {
-  color: color-mix(in srgb, var(--accent) 80%, var(--ink));
-}
-
-.text-action .icon {
-  width: 13px;
-  height: 13px;
-}
-
 .book-item {
   display: grid;
   grid-template-columns: 64px 1fr;
@@ -852,7 +892,7 @@ button {
   display: grid;
   place-items: center;
   color: #fff;
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 22px;
 }
 
@@ -1312,7 +1352,7 @@ html.theme-night .badge.match-low {
 
 .modal-head h3 {
   margin: 0;
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 20px;
 }
 
@@ -1340,98 +1380,6 @@ html.theme-night .badge.match-low {
   flex-shrink: 0;
 }
 
-.confirm-backdrop {
-  z-index: 60;
-  background: rgba(24, 30, 26, 0.28);
-}
-
-.confirm-dialog {
-  width: min(400px, 100%);
-  padding: 20px 20px 16px;
-  border-radius: 12px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--line);
-  box-shadow: 0 12px 32px color-mix(in srgb, #000 18%, transparent);
-  animation: confirmPop 160ms ease;
-}
-
-.confirm-dialog h3 {
-  margin: 0 0 8px;
-  font-family: "Iowan Old Style", "Songti SC", serif;
-  font-size: 18px;
-  font-weight: 600;
-  color: var(--ink);
-  text-align: left;
-}
-
-.confirm-dialog p {
-  margin: 0;
-  font-size: 13px;
-  line-height: 1.65;
-  color: var(--ink-muted);
-  white-space: pre-wrap;
-  word-break: break-word;
-  text-align: left;
-}
-
-.confirm-actions {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 18px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-}
-
-.confirm-btn {
-  min-width: 72px;
-  height: 34px;
-  padding: 0 14px;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
-}
-
-.confirm-btn.ghost {
-  background: transparent;
-  border-color: var(--line);
-  color: var(--ink);
-}
-
-.confirm-btn.ghost:hover {
-  background: rgba(20, 28, 24, 0.04);
-}
-
-.confirm-btn.primary {
-  background: var(--accent);
-  color: #fff;
-}
-
-.confirm-btn.primary:hover {
-  filter: brightness(1.04);
-}
-
-.confirm-btn.primary.danger {
-  background: #8f2f28;
-}
-
-.confirm-btn.primary.danger:hover {
-  background: #7a2822;
-}
-
-@keyframes confirmPop {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
 
 .source-row .info strong,
 .shelf-row .info strong {
@@ -1507,7 +1455,7 @@ html.theme-night .badge.match-low {
 
 .empty-guide h3 {
   margin: 0 0 10px;
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 22px;
 }
 
@@ -1623,18 +1571,24 @@ html.theme-night .badge.match-low {
   flex-direction: column;
   align-items: flex-end;
   gap: 8px;
-  z-index: 50;
+  /* 压在 Modal（Mantine 默认 200）与 probe-overlay 之上，换源 / 批量缓存的提示不能被遮罩吃掉 */
+  z-index: 320;
   pointer-events: none;
 }
 
-.toast {
-  padding: 12px 16px;
-  border-radius: 12px;
-  background: var(--ink);
-  color: var(--bg);
-  font-size: 13px;
-  max-width: 70vw;
+.toast-note {
+  max-width: min(420px, 70vw);
+  /* Notification 浅色方案下用的是 --mantine-color-white（纯白），这里接回 app 的浮层底色 */
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  box-shadow: 0 12px 28px color-mix(in srgb, #000 16%, transparent);
   animation: rise 220ms ease;
+}
+
+.toast-note,
+.toast-note .mantine-Notification-description {
+  font-size: 13px;
 }
 
 @keyframes rise {
@@ -1892,7 +1846,6 @@ html.theme-night .badge.match-low {
 
 .reader-toc header {
   padding: calc(var(--titlebar) + 8px) 12px 12px 16px;
-  -webkit-app-region: drag;
 }
 
 .reader-toc-head {
@@ -1900,7 +1853,6 @@ html.theme-night .badge.match-low {
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
-  -webkit-app-region: no-drag;
 }
 
 .reader-toc-head .toc-toggle {
@@ -1910,14 +1862,13 @@ html.theme-night .badge.match-low {
 
 .reader-toc header h3,
 .reader-toc header p {
-  -webkit-app-region: no-drag;
   position: relative;
   z-index: 1;
 }
 
 .reader-toc header h3 {
   margin: 0;
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 18px;
 }
 
@@ -1946,7 +1897,6 @@ html.theme-night .badge.match-low {
   flex: 1;
   overflow: auto;
   padding: 0 8px 16px;
-  -webkit-app-region: no-drag;
 }
 
 .chapter-list .virtual-list-item {
@@ -2057,13 +2007,12 @@ html.theme-night .badge.match-low {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px 20px 8px 72px;
-  -webkit-app-region: drag;
+  padding: 14px 20px 8px var(--traffic-inset);
   transition: padding 280ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .reader.toc-collapsed .reader-toolbar {
-  padding-left: 78px;
+  padding-left: var(--traffic-inset-edge);
 }
 
 .reader-toc-fab {
@@ -2082,7 +2031,6 @@ html.theme-night .badge.match-low {
   color: var(--reader-ink);
   box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent);
   cursor: pointer;
-  -webkit-app-region: no-drag;
   animation: tocFabIn 220ms cubic-bezier(0.22, 1, 0.36, 1);
   transition: transform 140ms ease, background 140ms ease;
 }
@@ -2107,13 +2055,11 @@ html.theme-night .badge.match-low {
   display: flex;
   align-items: center;
   gap: 8px;
-  -webkit-app-region: no-drag;
 }
 
 .reader-toolbar .actions {
   display: flex;
   gap: 8px;
-  -webkit-app-region: no-drag;
 }
 
 .reader-settings-panel {
@@ -2126,7 +2072,6 @@ html.theme-night .badge.match-low {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  -webkit-app-region: no-drag;
 }
 
 .reader-settings-row {
@@ -2214,7 +2159,6 @@ html.theme-night .badge.match-low {
   border: 1px solid color-mix(in srgb, var(--reader-ink) 12%, transparent);
   box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent);
   pointer-events: none;
-  -webkit-app-region: no-drag;
 }
 
 .reader-article {
@@ -2230,7 +2174,7 @@ html.theme-night .badge.match-low {
 }
 
 .reader-article h1 {
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 1.45em;
   font-weight: 600;
   margin: 0 0 1.2em;
@@ -2329,7 +2273,7 @@ html.theme-night .badge.match-low {
 }
 
 .about-brand strong {
-  font-family: "Iowan Old Style", "Songti SC", serif;
+  font-family: var(--font-serif);
   font-size: 22px;
 }
 

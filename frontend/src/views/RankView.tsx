@@ -1,7 +1,7 @@
+import { Button, Tabs, Text } from '@mantine/core'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { authorLabel } from '@shared/author'
 import type { RankBoard, RankBook, RankChannel, RankGender } from '@shared/types'
-import { LoadingIcon } from '../components/icons'
 import { VirtualList, type VirtualListHandle } from '../components/VirtualList'
 
 const CHANNELS: { id: RankChannel; label: string }[] = [
@@ -176,74 +176,63 @@ export const RankView = memo(function RankView({
             <p>起点中文网 · {subtitle}</p>
           </div>
           <div className="panel-actions">
-            <button
-              type="button"
-              className="btn ghost"
+            <Button
+              size="xs"
+              variant="default"
+              loading={loading}
               disabled={loading}
-              onClick={() => setReloadKey((k) => k + 1)}
               title="重新加载"
+              onClick={() => setReloadKey((k) => k + 1)}
             >
-              {loading ? <LoadingIcon /> : null}
               {loading ? '加载中' : '刷新'}
-            </button>
+            </Button>
           </div>
         </div>
 
-        <div className="rank-filters" role="toolbar" aria-label="排行筛选">
-          <div className="rank-seg" role="group" aria-label="频道">
-            {CHANNELS.map((c) => (
-              <button
-                key={c.id}
-                type="button"
-                className={channel === c.id ? 'active' : ''}
-                aria-pressed={channel === c.id}
-                onClick={() => switchChannel(c.id)}
-              >
-                {c.label}
-              </button>
-            ))}
+        <div className="rank-filters">
+          <div className="rank-filters-row">
+            <Tabs
+              value={channel}
+              onChange={(value) => value && switchChannel(value as RankChannel)}
+            >
+              <Tabs.List aria-label="频道">
+                {CHANNELS.map((c) => (
+                  <Tabs.Tab key={c.id} value={c.id}>
+                    {c.label}
+                  </Tabs.Tab>
+                ))}
+              </Tabs.List>
+            </Tabs>
+            {channel === 'rank' ? (
+              <Tabs value={board} onChange={(value) => value && switchBoard(value as RankBoard)}>
+                <Tabs.List aria-label="榜单">
+                  {BOARDS.map((b) => (
+                    <Tabs.Tab key={b.id} value={b.id}>
+                      {b.label}
+                    </Tabs.Tab>
+                  ))}
+                </Tabs.List>
+              </Tabs>
+            ) : null}
+            <Tabs value={gender} onChange={(value) => value && switchGender(value as RankGender)}>
+              <Tabs.List aria-label="频道性别">
+                {GENDERS.map((g) => (
+                  <Tabs.Tab key={g.id} value={g.id}>
+                    {g.label}
+                  </Tabs.Tab>
+                ))}
+              </Tabs.List>
+            </Tabs>
           </div>
-          {channel === 'rank' ? (
-            <div className="rank-seg" role="group" aria-label="榜单">
-              {BOARDS.map((b) => (
-                <button
-                  key={b.id}
-                  type="button"
-                  className={board === b.id ? 'active' : ''}
-                  aria-pressed={board === b.id}
-                  onClick={() => switchBoard(b.id)}
-                >
-                  {b.label}
-                </button>
+          <Tabs value={String(catId)} onChange={(value) => value && switchCat(Number(value))}>
+            <Tabs.List aria-label="小说分类">
+              {categories.map((c) => (
+                <Tabs.Tab key={c.id} value={String(c.id)}>
+                  {c.label}
+                </Tabs.Tab>
               ))}
-            </div>
-          ) : null}
-          <div className="rank-seg" role="group" aria-label="频道性别">
-            {GENDERS.map((g) => (
-              <button
-                key={g.id}
-                type="button"
-                className={gender === g.id ? 'active' : ''}
-                aria-pressed={gender === g.id}
-                onClick={() => switchGender(g.id)}
-              >
-                {g.label}
-              </button>
-            ))}
-          </div>
-          <div className="rank-seg rank-seg-wrap" role="group" aria-label="小说分类">
-            {categories.map((c) => (
-              <button
-                key={c.id}
-                type="button"
-                className={catId === c.id ? 'active' : ''}
-                aria-pressed={catId === c.id}
-                onClick={() => switchCat(c.id)}
-              >
-                {c.label}
-              </button>
-            ))}
-          </div>
+            </Tabs.List>
+          </Tabs>
         </div>
       </div>
 
@@ -253,9 +242,9 @@ export const RankView = memo(function RankView({
             <h3>起点暂时无法抓取</h3>
             <p>{error}</p>
             <div className="empty-actions">
-              <button type="button" className="btn" onClick={() => setReloadKey((k) => k + 1)}>
+              <Button size="sm" onClick={() => setReloadKey((k) => k + 1)}>
                 重试
-              </button>
+              </Button>
             </div>
           </div>
         ) : books.length > 0 ? (
@@ -306,23 +295,25 @@ export const RankView = memo(function RankView({
       </div>
 
       <div className="rank-pager">
-        <button
-          type="button"
-          className="btn ghost"
+        <Button
+          size="xs"
+          variant="default"
           disabled={loading || page <= 1}
           onClick={() => setPage((p) => Math.max(1, p - 1))}
         >
           上一页
-        </button>
-        <span className="rank-page-num">第 {page} 页</span>
-        <button
-          type="button"
-          className="btn ghost"
+        </Button>
+        <Text className="rank-page-num" size="xs" c="dimmed">
+          第 {page} 页
+        </Text>
+        <Button
+          size="xs"
+          variant="default"
           disabled={loading || !hasMore}
           onClick={() => setPage((p) => p + 1)}
         >
           下一页
-        </button>
+        </Button>
       </div>
     </div>
   )

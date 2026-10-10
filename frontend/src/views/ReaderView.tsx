@@ -485,7 +485,7 @@ export const ReaderView = memo(function ReaderView({
       ) : null}
       <aside className="reader-toc" aria-hidden={!tocOpen}>
         <div className="reader-toc-panel">
-          <header data-tauri-drag-region="">
+          <header data-tauri-drag-region="deep">
             <div className="reader-toc-head">
               <div>
                 <h3>{book.name}</h3>
@@ -536,7 +536,7 @@ export const ReaderView = memo(function ReaderView({
         </div>
       </aside>
       <div className="reader-body">
-        <div className="reader-toolbar" data-tauri-drag-region="">
+        <div className="reader-toolbar" data-tauri-drag-region="deep">
           <div className="reader-toolbar-left">
             <button
               className="btn ghost"
