@@ -2,10 +2,16 @@ import { useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { getCurrentWindow } from '@tauri-apps/api/window'
 
-const isCustomChrome =
-  typeof document !== 'undefined' &&
-  (document.documentElement.dataset.os === 'windows' ||
-    document.documentElement.dataset.os === 'linux')
+/** 运行时判断，避免模块加载早于 main.tsx 写入 data-os 时被冻成 false。 */
+function useCustomChrome(): boolean {
+  const [enabled] = useState(() => {
+    const os = document.documentElement.dataset.os
+    if (os === 'windows' || os === 'linux') return true
+    const ua = navigator.userAgent
+    return /Windows/i.test(ua) || (/Linux/i.test(ua) && !/Android/i.test(ua))
+  })
+  return enabled
+}
 
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false
@@ -18,10 +24,17 @@ function isEditableTarget(target: EventTarget | null): boolean {
  * 并承接原菜单里的重载与缩放快捷键。
  */
 export function WindowChrome() {
+  const enabled = useCustomChrome()
   const [maximized, setMaximized] = useState(false)
 
   useEffect(() => {
-    if (!isCustomChrome) return
+    if (!enabled) return
+    // 与 CSS 选择器对齐；防止模块加载顺序导致 data-os 未写上
+    if (!document.documentElement.dataset.os) {
+      document.documentElement.dataset.os = /Windows/i.test(navigator.userAgent)
+        ? 'windows'
+        : 'linux'
+    }
     const win = getCurrentWindow()
     let disposed = false
     void win.isMaximized().then((v) => {
@@ -36,10 +49,10 @@ export function WindowChrome() {
       disposed = true
       void unlisten.then((off) => off())
     }
-  }, [])
+  }, [enabled])
 
   useEffect(() => {
-    if (!isCustomChrome) return
+    if (!enabled) return
     const onKey = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target)) return
       const mod = e.ctrlKey || e.metaKey
@@ -66,9 +79,9 @@ export function WindowChrome() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [])
+  }, [enabled])
 
-  if (!isCustomChrome) return null
+  if (!enabled) return null
 
   const win = getCurrentWindow()
 

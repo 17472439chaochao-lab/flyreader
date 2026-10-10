@@ -2195,7 +2195,16 @@ async fn books_search(
 pub fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        // 不持久化 DECORATIONS：旧缓存里 decorated=true 会在 on_window_ready 里把
+        // set_decorations(false) 冲掉，表现为自定义按钮闪一下又变回系统标题栏。
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::DECORATIONS,
+                )
+                .build(),
+        )
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -2216,8 +2225,16 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             crate::app_menu::build(&handle).map_err(|e| e.to_string())?;
             // Windows / Linux：关掉原生标题栏与菜单栏，走前端自定义顶栏（对齐 macOS Overlay）
             #[cfg(any(windows, target_os = "linux"))]
-            if let Some(win) = handle.get_webview_window("main") {
-                let _ = win.set_decorations(false);
+            {
+                let apply_frameless = |app: &tauri::AppHandle| {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.set_decorations(false);
+                    }
+                };
+                apply_frameless(&handle);
+                // on_window_ready（window-state）可能晚于 setup，再投递一次兜底
+                let again = handle.clone();
+                let _ = handle.run_on_main_thread(move || apply_frameless(&again));
             }
             crate::theme::apply_app_theme(&handle, &settings);
             // 老板键注册要离开主线程，否则 macOS 上会等自己阻塞（见 boss_key 模块注释）

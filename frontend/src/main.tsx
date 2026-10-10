@@ -10,13 +10,14 @@ import './styles.css'
 
 window.fly = fly
 
-// 提前打 OS 标记：macOS 用原生 Overlay 红绿灯；Windows/Linux 用自定义无边框顶栏。
-const os = /Mac|iPhone|iPad/.test(navigator.userAgent)
-  ? 'macos'
-  : /Windows/.test(navigator.userAgent)
-    ? 'windows'
-    : 'linux'
-document.documentElement.dataset.os = os
+// index.html 已写入 data-os；这里再兜底一次（非 HTML 入口时）
+if (!document.documentElement.dataset.os) {
+  document.documentElement.dataset.os = /Mac|iPhone|iPad/.test(navigator.userAgent)
+    ? 'macos'
+    : /Windows/.test(navigator.userAgent)
+      ? 'windows'
+      : 'linux'
+}
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

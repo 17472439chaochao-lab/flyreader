@@ -5,6 +5,18 @@
     <!-- CSP 由 src-tauri/tauri.conf.json 的 app.security.csp 统一注入 -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlyReader</title>
+    <script>
+      // 早于模块加载写入，避免 CSS / WindowChrome 读不到 data-os
+      ;(function () {
+        var ua = navigator.userAgent
+        var os = /Mac|iPhone|iPad/.test(ua)
+          ? 'macos'
+          : /Windows/.test(ua)
+            ? 'windows'
+            : 'linux'
+        document.documentElement.dataset.os = os
+      })()
+    </script>
   </head>
   <body>
     <div id="root"></div>
