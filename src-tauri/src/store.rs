@@ -173,25 +173,49 @@ fn percent_decode(s: &str) -> String {
 
 /// 封面抽离进 book_covers 表，返回应写入书架 JSON 的 coverUrl 值。
 /// 与 persistCover 对齐：非 data URL 原样返回；data URL 转哨兵；无效返回 None（删键）。
-fn persist_cover(conn: &Connection, book_id: &str, cover_url: Option<&str>) -> Option<String> {
-    let url = cover_url?;
+/// 新语义：INSERT 失败返回 Err（不再吞错后仍返回哨兵，避免重启后封面丢失还查不出原因）；
+/// data URL 时 source_url 为 None/空；在线封面本地化时由调用方传原始 http(s) URL。
+fn persist_cover(
+    conn: &Connection,
+    book_id: &str,
+    cover_url: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(url) = cover_url else {
+        return Ok(None);
+    };
     if book_id.is_empty() {
-        return Some(url.to_string());
+        return Ok(Some(url.to_string()));
     }
     if !url.starts_with("data:") {
-        return Some(url.to_string());
+        return Ok(Some(url.to_string()));
     }
-    let (mime, bytes) = parse_data_url(url)?;
+    let Some((mime, bytes)) = parse_data_url(url) else {
+        return Ok(None);
+    };
     if bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     conn.execute(
-        "INSERT INTO book_covers (book_id, mime, data) VALUES (?1, ?2, ?3)
-         ON CONFLICT(book_id) DO UPDATE SET mime = excluded.mime, data = excluded.data",
-        params![book_id, mime, bytes],
+        "INSERT INTO book_covers (book_id, mime, data, source_url) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(book_id) DO UPDATE SET
+           mime = excluded.mime, data = excluded.data, source_url = excluded.source_url",
+        params![book_id, mime, bytes, source_url.unwrap_or("")],
     )
-    .ok();
-    Some(format!("{COVER_PREFIX}{book_id}"))
+    .map_err(|e| e.to_string())?;
+    Ok(Some(format!("{COVER_PREFIX}{book_id}")))
+}
+
+/// 查 book_covers.source_url（原始 http(s) 封面地址）：列不存在的旧库或空值都返回 None。
+fn get_cover_source_url(conn: &Connection, book_id: &str) -> Option<String> {
+    let url: Option<String> = conn
+        .query_row(
+            "SELECT source_url FROM book_covers WHERE book_id = ?1",
+            [book_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    url.filter(|u| !u.is_empty())
 }
 
 fn get_cover_data_url(conn: &Connection, book_id: &str) -> Option<String> {
@@ -202,11 +226,73 @@ fn get_cover_data_url(conn: &Connection, book_id: &str) -> Option<String> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .ok()?;
+    cover_data_url(&mime, &data)
+}
+
+/// 空 blob 视为缺失（不返回打不开的空 data URL），由调用方回退到 source_url。
+fn cover_data_url(mime: &str, data: &[u8]) -> Option<String> {
+    if data.is_empty() {
+        return None;
+    }
     Some(format!(
         "data:{};base64,{}",
         mime,
         base64::engine::general_purpose::STANDARD.encode(data)
     ))
+}
+
+/// 批量查封面：一行返回 (data URL, source_url)；旧库无 source_url 列时退回只查 mime/data。
+/// 分片 IN 查询，避开 SQLite 变量个数上限。
+fn load_cover_rows(
+    conn: &Connection,
+    ids: &[String],
+) -> HashMap<String, (Option<String>, Option<String>)> {
+    let mut out: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    const CHUNK: usize = 900;
+    for chunk in ids.chunks(CHUNK) {
+        let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let args: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let full_sql = format!(
+            "SELECT book_id, mime, data, source_url FROM book_covers WHERE book_id IN ({marks})"
+        );
+        let rows: Vec<(String, Option<String>, Option<String>)> = match conn.prepare(&full_sql) {
+            Ok(mut stmt) => stmt
+                .query_map(args.as_slice(), |r| {
+                    let id: String = r.get(0)?;
+                    let mime: String = r.get(1)?;
+                    let data: Vec<u8> = r.get(2)?;
+                    let src: Option<String> = r.get::<_, Option<String>>(3).ok().flatten();
+                    Ok((id, cover_data_url(&mime, &data), src.filter(|s| !s.is_empty())))
+                })
+                .map(|it| it.filter_map(Result::ok).collect())
+                .unwrap_or_default(),
+            Err(_) => {
+                // 旧库没有 source_url 列：退回旧版查询
+                let legacy_sql = format!(
+                    "SELECT book_id, mime, data FROM book_covers WHERE book_id IN ({marks})"
+                );
+                let Ok(mut stmt) = conn.prepare(&legacy_sql) else {
+                    continue;
+                };
+                stmt.query_map(args.as_slice(), |r| {
+                    let id: String = r.get(0)?;
+                    let mime: String = r.get(1)?;
+                    let data: Vec<u8> = r.get(2)?;
+                    Ok((id, cover_data_url(&mime, &data), None))
+                })
+                .map(|it| it.filter_map(Result::ok).collect())
+                .unwrap_or_default()
+            }
+        };
+        for (id, data_url, src) in rows {
+            out.insert(id, (data_url, src));
+        }
+    }
+    out
 }
 
 /// 落库前清理：删运行时 cache 字段、抽离 data URL 封面。对应 stripCacheField。
@@ -216,12 +302,16 @@ fn clean_shelf_book(conn: &Connection, book: &Value) -> Value {
     obj.remove("cache");
     let id = obj.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let cover = obj.get("coverUrl").and_then(|x| x.as_str()).map(|s| s.to_string());
-    match persist_cover(conn, &id, cover.as_deref()) {
-        Some(c) => {
+    // persist_cover 写库失败时保留原始 coverUrl 不变（降级，不丢封面），只记日志
+    match persist_cover(conn, &id, cover.as_deref(), None) {
+        Ok(Some(c)) => {
             obj.insert("coverUrl".into(), json!(c));
         }
-        None => {
+        Ok(None) => {
             obj.remove("coverUrl");
+        }
+        Err(e) => {
+            eprintln!("封面落库失败，保留原 coverUrl：{id} {e}");
         }
     }
     v
@@ -298,10 +388,13 @@ impl Store {
         if let Some(c) = &self.sources_cache {
             return c.clone();
         }
-        let mut stmt = self
+        // prepare 失败时返回空列表而不是 panic：书源读不到至多显示为空，不应崩掉整个应用
+        let Ok(mut stmt) = self
             .conn
             .prepare("SELECT data FROM sources ORDER BY sort_order ASC, book_source_url ASC")
-            .unwrap();
+        else {
+            return Vec::new();
+        };
         let list: Vec<Value> = stmt
             .query_map([], |r| {
                 let s: String = r.get(0)?;
@@ -321,7 +414,9 @@ impl Store {
     pub fn save_sources(&mut self, sources: &[Value]) -> Result<(), String> {
         let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let existing: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT book_source_url FROM sources").unwrap();
+            let mut stmt = tx
+                .prepare("SELECT book_source_url FROM sources")
+                .map_err(|e| e.to_string())?;
             stmt.query_map([], |r| r.get(0))
                 .map(|rows| rows.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default()
@@ -557,14 +652,28 @@ impl Store {
         })();
         match result {
             Some(rows) => {
-                let conn = &self.conn;
+                // 封面一次 IN 查询批量取回（data URL + source_url），不再逐本 SELECT
+                let ids: Vec<String> = rows
+                    .iter()
+                    .filter_map(|b| {
+                        let sentinel = b
+                            .get("coverUrl")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|s| s.starts_with(COVER_PREFIX));
+                        if sentinel {
+                            b.get("id").and_then(|v| v.as_str()).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let cover_rows = load_cover_rows(&self.conn, &ids);
                 let cover_cache = &mut self.cover_cache;
                 self.shelf_cache = Some(
                     rows.into_iter()
                         .map(|b| {
                             let cleaned = strip_cache_no_persist(&b);
-                            let with_cover = attach_cover_cached(conn, cover_cache, cleaned);
-                            with_cover
+                            attach_cover_with_rows(cleaned, cover_cache, &cover_rows)
                         })
                         .collect(),
                 );
@@ -580,8 +689,10 @@ impl Store {
         self.shelf_cache.clone().unwrap_or_default()
     }
 
-    pub fn upsert_shelf_book(&mut self, book: &Value) -> Result<Vec<Value>, String> {
-        let clean = clean_shelf_book(&self.conn, book);
+    /// 在给定连接上写一行书架记录（供 upsert_shelf_book / replace_chapters_and_upsert
+    /// 在同一事务内复用，调用方负责开事务与提交）。返回清理后的书 id。
+    fn upsert_shelf_row(conn: &Connection, book: &Value) -> Result<String, String> {
+        let clean = clean_shelf_book(conn, book);
         let id = clean.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let updated_at = clean
             .get("updatedAt")
@@ -589,8 +700,7 @@ impl Store {
             .filter(|v| *v > 0)
             .unwrap_or_else(now_ms);
         let data = serde_json::to_string(&clean).map_err(|e| e.to_string())?;
-        let exists: bool = self
-            .conn
+        let exists: bool = conn
             .query_row(
                 "SELECT COUNT(*) FROM shelf_books WHERE id = ?1",
                 [&id],
@@ -598,25 +708,33 @@ impl Store {
             )
             .unwrap_or(false);
         if exists {
-            self.conn
-                .execute(
-                    "UPDATE shelf_books SET data = ?1, updated_at = ?2 WHERE id = ?3",
-                    params![data, updated_at, id],
-                )
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE shelf_books SET data = ?1, updated_at = ?2 WHERE id = ?3",
+                params![data, updated_at, id],
+            )
+            .map_err(|e| e.to_string())?;
         } else {
-            let min: Option<i64> = self
-                .conn
+            let min: Option<i64> = conn
                 .query_row("SELECT MIN(sort_order) FROM shelf_books", [], |r| r.get(0))
                 .unwrap_or(None);
             let sort = min.map(|m| m - 1).unwrap_or(0);
-            self.conn
-                .execute(
-                    "INSERT INTO shelf_books (id, data, sort_order, updated_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![id, data, sort, updated_at],
-                )
-                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO shelf_books (id, data, sort_order, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, data, sort, updated_at],
+            )
+            .map_err(|e| e.to_string())?;
         }
+        Ok(id)
+    }
+
+    pub fn upsert_shelf_book(&mut self, book: &Value) -> Result<Vec<Value>, String> {
+        // 封面抽离（写 book_covers）与书架行写在同一事务里：中途失败整体回滚，
+        // 不会出现「书架已是哨兵、blob 却没落库」的半截状态
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let id = Self::upsert_shelf_row(&tx, book)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        // 封面可能已换：清掉该书的内存封面缓存，下次读回时以库里 blob 为准，不返回旧封面
+        self.cover_cache.remove(&id);
         self.shelf_cache = None;
         Ok(self.get_shelf())
     }
@@ -625,7 +743,9 @@ impl Store {
     pub fn save_shelf(&mut self, shelf: &[Value]) -> Result<(), String> {
         let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
         let existing: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM shelf_books").unwrap();
+            let mut stmt = tx
+                .prepare("SELECT id FROM shelf_books")
+                .map_err(|e| e.to_string())?;
             stmt.query_map([], |r| r.get(0))
                 .map(|rows| rows.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default()
@@ -668,6 +788,8 @@ impl Store {
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
+        // 整架重写可能换了任意一本的封面：清掉全部内存封面缓存，避免返回旧封面
+        self.cover_cache.clear();
         self.shelf_cache = None;
         Ok(())
     }
@@ -679,13 +801,17 @@ impl Store {
         chapter_index: Option<f64>,
         last_read_at: Option<i64>,
     ) -> Result<Option<Value>, String> {
-        let row: Option<String> = self
-            .conn
+        // 读行 + 清理 + 写回包进同一事务：中途失败不留半截进度
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let row: Option<String> = tx
             .query_row("SELECT data FROM shelf_books WHERE id = ?1", [id], |r| r.get(0))
             .ok();
-        let Some(raw) = row else { return Ok(None) };
+        let Some(raw) = row else {
+            drop(tx);
+            return Ok(None);
+        };
         let parsed: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-        let mut book = clean_shelf_book(&self.conn, &parsed);
+        let mut book = clean_shelf_book(&tx, &parsed);
         if let Some(obj) = book.as_object_mut() {
             if let Some(t) = scroll_top {
                 obj.insert("scrollTop".into(), json!(t.max(0.0).round()));
@@ -699,12 +825,12 @@ impl Store {
             obj.insert("updatedAt".into(), json!(now_ms()));
         }
         let updated_at = book.get("updatedAt").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
-        self.conn
-            .execute(
-                "UPDATE shelf_books SET data = ?1, updated_at = ?2 WHERE id = ?3",
-                params![serde_json::to_string(&book).map_err(|e| e.to_string())?, updated_at, id],
-            )
-            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE shelf_books SET data = ?1, updated_at = ?2 WHERE id = ?3",
+            params![serde_json::to_string(&book).map_err(|e| e.to_string())?, updated_at, id],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         let attached = attach_cover_cached(&self.conn, &mut self.cover_cache, book);
         if let Some(cache) = &mut self.shelf_cache {
             if let Some(item) = cache.iter_mut().find(|b| b.get("id").and_then(|v| v.as_str()) == Some(id)) {
@@ -717,17 +843,53 @@ impl Store {
     }
 
     pub fn remove_shelf_book(&mut self, id: &str) -> Result<Vec<Value>, String> {
-        self.conn
-            .execute("DELETE FROM book_covers WHERE book_id = ?1", [id])
-            .ok();
-        self.conn
-            .execute("DELETE FROM shelf_books WHERE id = ?1", [id])
+        // 封面行与书架行同事务删除：避免只删了一半
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM book_covers WHERE book_id = ?1", [id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM shelf_books WHERE id = ?1", [id])
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
         self.cover_cache.remove(id);
         if let Some(cache) = &mut self.shelf_cache {
             cache.retain(|b| b.get("id").and_then(|v| v.as_str()) != Some(id));
         }
         Ok(self.get_shelf())
+    }
+
+    /// 本地封面 blob 是否已落库（在线封面本地化前查重，避免重复下载）。
+    pub fn has_cover_blob(&self, book_id: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM book_covers WHERE book_id = ?1",
+                [book_id],
+                |r| r.get::<_, i64>(0).map(|n| n > 0),
+            )
+            .unwrap_or(false)
+    }
+
+    /// 把下载到的在线封面写入 book_covers（mime、data、source_url=原始 URL），
+    /// 并清掉该书的内存封面缓存，下次读回以新 blob 为准。
+    pub fn store_cover_blob(
+        &mut self,
+        book_id: &str,
+        mime: &str,
+        data: &[u8],
+        source_url: Option<&str>,
+    ) -> Result<(), String> {
+        if book_id.is_empty() || data.is_empty() {
+            return Err("封面数据为空".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO book_covers (book_id, mime, data, source_url) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(book_id) DO UPDATE SET
+                   mime = excluded.mime, data = excluded.data, source_url = excluded.source_url",
+                params![book_id, mime, data, source_url.unwrap_or("")],
+            )
+            .map_err(|e| e.to_string())?;
+        self.cover_cache.remove(book_id);
+        Ok(())
     }
 
     // ---------- 章节正文缓存 ----------
@@ -804,6 +966,38 @@ impl Store {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    /// 本地导入的原子落库：同一事务内完成 replace_chapters + upsert_shelf_book，
+    /// 避免章节已替换、书架行却没写上的半截状态（之前是两步分开调用）。
+    pub fn replace_chapters_and_upsert(
+        &mut self,
+        book_id: &str,
+        rows: &[ChapterRow],
+        book: &Value,
+    ) -> Result<Vec<Value>, String> {
+        let cached_at = now_ms();
+        let tx = self.conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM chapters WHERE book_id = ?1", [book_id])
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO chapters (book_id, chapter_url, chapter_index, title, content, cached_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(book_id, chapter_url) DO UPDATE SET
+                   content = excluded.content,
+                   chapter_index = COALESCE(excluded.chapter_index, chapters.chapter_index),
+                   title = COALESCE(excluded.title, chapters.title),
+                   cached_at = excluded.cached_at",
+                params![book_id, row.url, row.index, row.title, row.content, cached_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let id = Self::upsert_shelf_row(&tx, book)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.cover_cache.remove(&id);
+        self.shelf_cache = None;
+        Ok(self.get_shelf())
+    }
+
     /// 书架里该书是否被标记为 Markdown 本地书（localFormat / kind），单行读取避免克隆整个书架。
     pub fn is_markdown_local(&self, book_id: &str) -> bool {
         let Ok(data): rusqlite::Result<String> = self.conn.query_row(
@@ -867,34 +1061,66 @@ impl Store {
 
     /// 某书的缓存概况；`chapters` 为空数组时按 0 章处理（与 getBookCacheInfo 一致）。
     pub fn book_cache_info(&self, book_id: &str, chapters: Option<&Value>, caching: bool) -> Value {
-        let readable: Vec<String> = chapters
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .filter(|c| {
-                        c.get("url").and_then(Value::as_str).is_some_and(|u| !u.is_empty())
-                            && c.get("isVolume").and_then(Value::as_bool) != Some(true)
-                    })
-                    .filter_map(|c| c.get("url").and_then(Value::as_str).map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let readable: Vec<String> = readable_chapter_urls(chapters);
         let total = readable.len();
         let cached = self.count_cached_chapters(book_id, &readable);
-        let status = if caching {
-            "caching"
-        } else if total == 0 || cached == 0 {
-            "none"
-        } else if cached >= total {
-            "full"
-        } else {
-            "partial"
-        };
-        json!({ "bookId": book_id, "total": total, "cached": cached, "status": status })
+        book_cache_info_parts(book_id, total, cached, caching)
+    }
+
+    /// enrich_shelf 用的批量版：cached 由调用方一次 IN 查询算好，不再逐本 COUNT(*)
+    fn book_cache_info_batched(
+        book_id: &str,
+        chapters: Option<&Value>,
+        caching: bool,
+        cached_urls: &std::collections::HashSet<String>,
+    ) -> Value {
+        let readable: Vec<String> = readable_chapter_urls(chapters);
+        let total = readable.len();
+        let cached = readable.iter().filter(|u| cached_urls.contains(*u)).count();
+        book_cache_info_parts(book_id, total, cached, caching)
+    }
+
+    /// 一次 IN 查询取回多本书的已缓存章节 URL（分片，避开 SQLite 变量个数上限），
+    /// 供 enrich_shelf 在内存里按书统计，避免逐本 COUNT(*)。
+    fn cached_urls_by_book(&self, book_ids: &[String]) -> HashMap<String, std::collections::HashSet<String>> {
+        let mut out: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        if book_ids.is_empty() {
+            return out;
+        }
+        const CHUNK: usize = 900;
+        for chunk in book_ids.chunks(CHUNK) {
+            let marks = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT book_id, chapter_url FROM chapters WHERE book_id IN ({marks})"
+            );
+            let Ok(mut stmt) = self.conn.prepare(&sql) else {
+                continue;
+            };
+            let args: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let Ok(rows) = stmt.query_map(args.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) else {
+                continue;
+            };
+            for row in rows.flatten() {
+                out.entry(row.0).or_default().insert(row.1);
+            }
+        }
+        out
     }
 
     /// 给书架条目附加运行时 cache 字段（对应 enrichShelf）；`caching_ids` 是在跑的缓存任务。
     pub fn enrich_shelf(&self, list: &[Value], caching_ids: &[String]) -> Vec<Value> {
+        // 先一次批量查出全部在线书的已缓存章节 URL，再逐本在内存里计数
+        let online_ids: Vec<String> = list
+            .iter()
+            .filter(|b| !is_local_book(b))
+            .map(|b| b.get("id").and_then(Value::as_str).unwrap_or("").to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+        let cached_by_book = self.cached_urls_by_book(&online_ids);
+        let empty_set: std::collections::HashSet<String> = std::collections::HashSet::new();
         list.iter()
             .map(|book| {
                 let id = book.get("id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -904,7 +1130,8 @@ impl Store {
                     json!({ "bookId": id, "total": total, "cached": total, "status": "full" })
                 } else {
                     let caching = caching_ids.iter().any(|i| *i == id);
-                    self.book_cache_info(&id, v.get("chapters"), caching)
+                    let cached_urls = cached_by_book.get(&id).unwrap_or(&empty_set);
+                    Self::book_cache_info_batched(&id, v.get("chapters"), caching, cached_urls)
                 };
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("cache".into(), cache);
@@ -1124,10 +1351,13 @@ impl Store {
     // ---------- 搜索历史 ----------
 
     pub fn get_search_history(&self) -> Vec<String> {
-        let mut stmt = self
+        // prepare 失败时返回空历史而不是 panic
+        let Ok(mut stmt) = self
             .conn
             .prepare("SELECT keyword FROM search_history ORDER BY searched_at DESC, ROWID DESC LIMIT 20")
-            .unwrap();
+        else {
+            return Vec::new();
+        };
         stmt.query_map([], |r| r.get(0))
             .map(|rows| rows.filter_map(|x| x.ok()).collect())
             .unwrap_or_default()
@@ -1205,9 +1435,11 @@ fn merge_legacy_tables(conn: &Connection) -> Result<Value, String> {
         rows
     };
     let has = |t: &str| tables.iter().any(|n| n == t);
+    // 6 条合并语句包进同一个事务：中途失败整体回滚，不留半截导入
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut out = serde_json::Map::new();
     let mut merge = |key: &str, present: bool, sql: &str| -> Result<(), String> {
-        let n = if present { copy_legacy_rows(conn, sql)? } else { 0 };
+        let n = if present { copy_legacy_rows(&tx, sql)? } else { 0 };
         out.insert(key.to_string(), json!(n));
         Ok(())
     };
@@ -1215,9 +1447,41 @@ fn merge_legacy_tables(conn: &Connection) -> Result<Value, String> {
     merge("sources", has("sources"), "INSERT OR REPLACE INTO main.sources (book_source_url, data, sort_order) SELECT book_source_url, data, sort_order FROM legacy.sources")?;
     merge("shelf", has("shelf_books"), "INSERT OR REPLACE INTO main.shelf_books (id, data, sort_order, updated_at) SELECT id, data, sort_order, updated_at FROM legacy.shelf_books")?;
     merge("history", has("search_history"), "INSERT OR REPLACE INTO main.search_history (keyword, searched_at) SELECT keyword, searched_at FROM legacy.search_history")?;
+    // 旧库 book_covers 可能没有 source_url 列：只合 mime/data 两列，新列留默认值 ''
     merge("covers", has("book_covers"), "INSERT OR REPLACE INTO main.book_covers (book_id, mime, data) SELECT book_id, mime, data FROM legacy.book_covers")?;
     merge("chapters", has("chapters"), "INSERT OR IGNORE INTO main.chapters (book_id, chapter_url, chapter_index, title, content, cached_at) SELECT book_id, chapter_url, chapter_index, title, content, cached_at FROM legacy.chapters")?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(Value::Object(out))
+}
+
+/// 可阅读章节的 URL 列表：跳过卷名行与无 URL 的条目。
+fn readable_chapter_urls(chapters: Option<&Value>) -> Vec<String> {
+    chapters
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter(|c| {
+                    c.get("url").and_then(Value::as_str).is_some_and(|u| !u.is_empty())
+                        && c.get("isVolume").and_then(Value::as_bool) != Some(true)
+                })
+                .filter_map(|c| c.get("url").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 由 total/cached 拼缓存概况 JSON（book_cache_info 单本版与批量版共用）。
+fn book_cache_info_parts(book_id: &str, total: usize, cached: usize, caching: bool) -> Value {
+    let status = if caching {
+        "caching"
+    } else if total == 0 || cached == 0 {
+        "none"
+    } else if cached >= total {
+        "full"
+    } else {
+        "partial"
+    };
+    json!({ "bookId": book_id, "total": total, "cached": cached, "status": status })
 }
 
 /// loadShelfCache 对齐：库里不应有 cache 字段，仅剥离（不做封面重持久化，避免读路径写库）。
@@ -1229,6 +1493,37 @@ fn strip_cache_no_persist(book: &Value) -> Value {
     v
 }
 
+/// 封面还原（批量路径）：blob 存在则还原 data URL；blob 缺失但 source_url 存在
+/// 则回退到原始 http(s) URL；两者都没有才删 coverUrl。
+/// 内存缓存只存 data URL：回退的 http URL 不进缓存，否则 blob 恢复后仍返回旧地址。
+fn attach_cover_with_rows(
+    book: Value,
+    cover_cache: &mut HashMap<String, String>,
+    rows: &HashMap<String, (Option<String>, Option<String>)>,
+) -> Value {
+    let sentinel = book
+        .get("coverUrl")
+        .and_then(|c| c.as_str())
+        .map(|s| s.starts_with(COVER_PREFIX))
+        .unwrap_or(false);
+    if !sentinel {
+        return book;
+    }
+    let id = book.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let resolved: Option<String> = cover_cache.get(&id).cloned().or_else(|| {
+        let (data_url, source_url) = rows.get(&id)?;
+        match data_url.clone() {
+            Some(d) => {
+                cover_cache.insert(id.clone(), d.clone());
+                Some(d)
+            }
+            None => source_url.clone(),
+        }
+    });
+    apply_cover(book, resolved)
+}
+
+/// 封面还原（单本路径，供 patch_shelf_progress 等调用）：同样先 blob、再 source_url 回退。
 fn attach_cover_cached(
     conn: &Connection,
     cover_cache: &mut HashMap<String, String>,
@@ -1243,16 +1538,23 @@ fn attach_cover_cached(
         return book;
     }
     let id = book.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let cached = cover_cache.get(&id).cloned().or_else(|| {
-        let d = get_cover_data_url(conn, &id)?;
+    if let Some(cached) = cover_cache.get(&id).cloned() {
+        return apply_cover(book, Some(cached));
+    }
+    let data_url = get_cover_data_url(conn, &id);
+    if let Some(d) = &data_url {
         cover_cache.insert(id.clone(), d.clone());
-        Some(d)
-    });
+    }
+    let resolved = data_url.or_else(|| get_cover_source_url(conn, &id));
+    apply_cover(book, resolved)
+}
+
+fn apply_cover(book: Value, resolved: Option<String>) -> Value {
     let mut b = book;
-    match cached {
-        Some(data_url) => {
+    match resolved {
+        Some(url) => {
             if let Some(obj) = b.as_object_mut() {
-                obj.insert("coverUrl".into(), json!(data_url));
+                obj.insert("coverUrl".into(), json!(url));
             }
         }
         None => {
@@ -1628,5 +1930,56 @@ mod tests {
             .unwrap();
         assert_eq!(dup.len(), 1);
         assert_eq!(dup[0]["bookSourceName"], json!("覆盖"), "URL 撞车时保留编辑后的版本");
+    }
+
+    #[test]
+    fn cover_survives_restart_as_data_url() {
+        let dir = temp_dir("cover-restart");
+        let data_url = "data:image/png;base64,aGVsbG8=";
+        {
+            let mut s = Store::open(&dir).unwrap();
+            s.upsert_shelf_book(&json!({
+                "id": "b1", "name": "测试", "origin": "https://a.com",
+                "coverUrl": data_url
+            }))
+            .unwrap();
+        }
+        let mut reopened = Store::open(&dir).unwrap();
+        let shelf = reopened.get_shelf();
+        assert_eq!(shelf.len(), 1);
+        assert_eq!(
+            shelf[0]["coverUrl"].as_str(),
+            Some(data_url),
+            "重启后哨兵应还原为原来的 data URL"
+        );
+    }
+
+    #[test]
+    fn cover_falls_back_to_source_url_when_blob_missing() {
+        let dir = temp_dir("cover-fallback");
+        let mut s = Store::open(&dir).unwrap();
+        s.upsert_shelf_book(&json!({
+            "id": "b1", "name": "测试", "origin": "https://a.com",
+            "coverUrl": "data:image/png;base64,aGVsbG8="
+        }))
+        .unwrap();
+        // 模拟「blob 丢失但 source_url 仍在」：把 blob 清空并写上原始 http 地址。
+        // 注意整行物理删除会连 source_url 一起丢，所以这里保留行、只清 blob，
+        // 覆盖的就是「blob 缺失但 source_url 存在」的回退分支。
+        s.conn
+            .execute(
+                "UPDATE book_covers SET data = zeroblob(0), source_url = 'https://cdn.example.com/cover.jpg' WHERE book_id = 'b1'",
+                [],
+            )
+            .unwrap();
+        drop(s);
+        let mut reopened = Store::open(&dir).unwrap();
+        let shelf = reopened.get_shelf();
+        assert_eq!(shelf.len(), 1);
+        assert_eq!(
+            shelf[0]["coverUrl"].as_str(),
+            Some("https://cdn.example.com/cover.jpg"),
+            "blob 缺失时应回退到原始 http 封面，而不是删掉 coverUrl"
+        );
     }
 }

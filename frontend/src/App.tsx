@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Loader, Modal, Notification, Text, useMantineColorScheme } from '@mantine/core'
+import { Button, Notification, useMantineColorScheme } from '@mantine/core'
 import { filterChangeSourceCandidates, filterRelevantSearchHits, dedupeSearchBooks } from '@shared/searchRelevance'
-import { authorLabel } from '@shared/author'
 import { pickBookAuthor, pickBookName } from '@shared/bookMeta'
-import { isLocalBook } from '@shared/bookLocal'
+import { isLocalBook, isMdBook } from '@shared/bookLocal'
+import { bookId, buildShelfBook, fetchBookDetail } from '@shared/bookDetail'
 import { catalogUpdateKind, countAddedChapters, matchChapterIndex, readableChapters } from '@shared/matchChapter'
 import {
   DEFAULT_PREFS,
@@ -13,7 +13,6 @@ import {
   type Chapter,
   type ReaderSettings,
   type SearchBook,
-  type SearchProgress,
   type ShelfBook,
   type ShelfSort,
   type ViewName
@@ -22,6 +21,7 @@ import { ConfirmDialog, type ConfirmOutcome, type ConfirmRequest } from './compo
 import { ChangeSourceDialog } from './components/ChangeSourceDialog'
 import { SidebarMotto } from './components/SidebarMotto'
 import { WindowChrome } from './components/WindowChrome'
+import { useBookSearch } from './hooks/useBookSearch'
 import { useEyeCareReminder } from './hooks/useEyeCareReminder'
 import { AboutView } from './views/AboutView'
 import { RankView } from './views/RankView'
@@ -36,15 +36,6 @@ import {
 } from './utils/shelfMatch'
 import { formatProgressLabel, runWithProgress } from './utils/progress'
 import type { LegacyDataStatus, LegacyImportResult } from './tauri/shim'
-
-/**
- * 由书源 origin 与书籍 URL 生成书架唯一 ID
- * @param origin 书源标识
- * @param bookUrl 书籍详情 URL
- */
-function bookId(origin: string, bookUrl: string): string {
-  return `${origin}::${bookUrl}`
-}
 
 /**
  * 各视图对外暴露的回调集合（扁平命名，供 ref 镜像与稳定包装复用）。
@@ -109,16 +100,19 @@ export default function App() {
   /** 搜索命中书籍校验期间的持久加载指示（toast 会过期消失，此遮罩保持到校验结束） */
   const [probeState, setProbeState] = useState<string | null>(null)
   const [keyword, setKeyword] = useState('')
-  const [searching, setSearching] = useState(false)
-  const [searchProgress, setSearchProgress] = useState<SearchProgress | null>(null)
-  const [results, setResults] = useState<SearchBook[]>([])
+  /** 搜索状态（结果/进行中/进度）由 useBookSearch 统一管理，与换源对话框共用同一实现 */
+  const {
+    results,
+    searching,
+    progress: searchProgress,
+    runSearch: runBookSearch
+  } = useBookSearch({ filterHits: (key, hits) => filterRelevantSearchHits(key, hits) })
   const [searchHistory, setSearchHistory] = useState<string[]>([])
   const [reading, setReading] = useState<ShelfBook | null>(null)
   const readingRef = useRef<ShelfBook | null>(null)
   readingRef.current = reading
   const viewRef = useRef<ViewName>('shelf')
   viewRef.current = view
-  const searchGenRef = useRef(0)
   const chapterLoadGenRef = useRef(0)
   const [chapters, setChapters] = useState<Chapter[]>([])
   const [content, setContent] = useState('')
@@ -139,6 +133,19 @@ export default function App() {
 
   // 最新视图回调镜像：每次渲染刷新，供下方稳定包装读取，避免闭包陈旧与全树重渲染
   const viewCbRef = useRef<ViewCallbacks | null>(null)
+
+  /**
+   * 视图回调守卫：统一收敛 viewCbRef.current! 的 33 处调用点。
+   * ref 为空时静默跳过（只在挂载前理论上发生），调用方不再写非空断言。
+   */
+  const callView = useCallback(
+    <T,>(fn: (cb: ViewCallbacks) => T): T => {
+      const cb = viewCbRef.current
+      if (!cb) return undefined as T
+      return fn(cb)
+    },
+    []
+  )
 
   /** 安全提取错误文案：Tauri invoke 抛出的值未必是标准 Error，message 可能缺失 */
   const errMsg = useCallback((e: unknown, fallback: string): string => {
@@ -234,7 +241,6 @@ export default function App() {
     void reloadAllState().then((state) => {
       if (state.prefs?.lastView) setView(state.prefs.lastView)
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   /** 启动后静默检查更新：仅在有新版本时提示 */
@@ -333,7 +339,8 @@ export default function App() {
   }
 
   /**
-   * 执行多书源并发搜索（支持进度与中间结果流式更新）
+   * 执行多书源并发搜索：流式合并/去重/代际守卫由 useBookSearch 负责，
+   * 这里只做启用校验、历史与书源刷新、结果提示。
    * @param raw 可选关键词；缺省使用当前输入框内容
    */
   async function runSearch(raw?: string) {
@@ -344,56 +351,21 @@ export default function App() {
       goView('sources')
       return
     }
-    const gen = ++searchGenRef.current
     setKeyword(key)
-    setSearching(true)
-    setResults([])
-    setSearchProgress({
-      done: 0,
-      total: enabledCount,
-      found: 0,
-      current: '',
-      phase: 'start'
-    })
     try {
-      const { books, history, sources: nextSources } = await runWithProgress(
-        (track) => {
-          track(
-            window.fly.books.onSearchProgress((p) => {
-              if (gen !== searchGenRef.current) return
-              setSearchProgress(p)
-            })
-          )
-          track(
-            window.fly.books.onSearchPartial((books) => {
-              if (gen !== searchGenRef.current) return
-              const filtered = filterRelevantSearchHits(key, books)
-              if (!filtered.length) return
-              setResults((prev) => dedupeSearchBooks(prev.concat(filtered)))
-            })
-          )
-        },
-        () => window.fly.books.search(key)
-      )
-      if (gen !== searchGenRef.current) return
-      const cleaned = dedupeSearchBooks(filterRelevantSearchHits(key, books))
-      setResults(cleaned)
-      setSearchHistory(history)
-      if (nextSources?.length) setSources(nextSources)
+      const res = await runBookSearch(key)
+      if (!res) return
+      setSearchHistory(res.history)
+      if (res.sources?.length) setSources(res.sources)
       else {
         const latest = await window.fly.sources.list()
         setSources(latest)
       }
+      const cleaned = dedupeSearchBooks(filterRelevantSearchHits(key, res.books))
       if (!cleaned.length) showToast('未搜索到结果，可换个书源或关键词')
       else showToast(`搜索完成，共 ${cleaned.length} 条结果`)
     } catch (e) {
-      if (gen !== searchGenRef.current) return
       showToast(`搜索失败：${(e as Error).message}`)
-    } finally {
-      if (gen === searchGenRef.current) {
-        setSearching(false)
-        setSearchProgress(null)
-      }
     }
   }
 
@@ -460,23 +432,11 @@ export default function App() {
       // 确认 → 仍作为独立书架条目添加
     }
 
-    const now = Date.now()
+    // 仅加书架不拉详情：用空详情构造，lastReadAt 保持 0（未读过）
     const item: ShelfBook = {
-      id,
-      name: book.name,
-      author: book.author,
-      bookUrl: book.bookUrl,
-      coverUrl: book.coverUrl,
-      intro: book.intro,
-      kind: book.kind,
-      lastChapter: book.lastChapter,
-      origin: book.origin,
-      originName: book.originName,
-      chapterIndex: 0,
-      scrollTop: 0,
-      addedAt: now,
-      updatedAt: now,
-      lastReadAt: 0
+      ...buildShelfBook(book, { info: null, tocUrl: book.bookUrl, chapters: [] }),
+      lastReadAt: 0,
+      chapters: undefined
     }
     const next = await window.fly.shelf.upsert(item)
     setShelf(next)
@@ -491,28 +451,13 @@ export default function App() {
   async function replaceShelfWithSearchBook(old: ShelfBook, candidate: SearchBook) {
     setShelfBusyIds((prev) => (prev.includes(old.id) ? prev : [...prev, old.id]))
     try {
-      const info = await window.fly.books.info(candidate.origin, candidate.bookUrl)
-      const tocUrl = info.tocUrl || candidate.bookUrl
-      const list = await window.fly.books.toc(candidate.origin, tocUrl)
-      if (!list.filter((c: Chapter) => c.url && !c.isVolume).length) {
+      const detail = await fetchBookDetail(candidate.origin, candidate.bookUrl)
+      if (!detail.chapters.filter((c: Chapter) => c.url && !c.isVolume).length) {
         throw new Error('无法获取目录')
       }
       const newBook: ShelfBook = {
-        ...old,
-        id: bookId(candidate.origin, candidate.bookUrl),
-        name: pickBookName(info.name, candidate.name, old.name),
-        author: pickBookAuthor(info.author, candidate.author, old.author),
-        bookUrl: candidate.bookUrl,
-        coverUrl: info.coverUrl || candidate.coverUrl || old.coverUrl,
-        intro: info.intro || candidate.intro || old.intro,
-        kind: info.kind || candidate.kind || old.kind,
-        lastChapter: info.lastChapter || candidate.lastChapter,
-        origin: candidate.origin,
-        originName: candidate.originName,
-        tocUrl,
-        chapters: list,
-        chapterIndex: matchChapterIndex(old, list),
-        updatedAt: Date.now()
+        ...buildShelfBook(candidate, detail, old),
+        chapterIndex: matchChapterIndex(old, detail.chapters)
       }
       await window.fly.shelf.remove(old.id)
       const next = await window.fly.shelf.upsert(newBook)
@@ -538,23 +483,16 @@ export default function App() {
     if (shelfBusyIds.includes(book.id) || shelfUpdatingAll) return
     setShelfBusyIds((prev) => (prev.includes(book.id) ? prev : [...prev, book.id]))
     try {
-      const info = await window.fly.books.info(book.origin, book.bookUrl)
-      const tocUrl = info.tocUrl || book.tocUrl || book.bookUrl
-      const list = await window.fly.books.toc(book.origin, tocUrl)
+      const detail = await fetchBookDetail(book.origin, book.bookUrl, book.tocUrl)
+      const list = detail.chapters
       const kind = catalogUpdateKind(book.chapters, list)
       const added = countAddedChapters(book.chapters, list)
       const total = readableChapters(list).length
       const updated: ShelfBook = {
-        ...book,
-        name: pickBookName(info.name, book.name),
-        author: pickBookAuthor(info.author, book.author),
-        coverUrl: info.coverUrl || book.coverUrl,
-        intro: info.intro || book.intro,
-        lastChapter: info.lastChapter || list[list.length - 1]?.title || book.lastChapter,
-        tocUrl,
-        chapters: list,
-        chapterIndex: matchChapterIndex(book, list),
-        updatedAt: Date.now()
+        ...buildShelfBook(book, detail, book),
+        lastChapter:
+          detail.info?.lastChapter || list[list.length - 1]?.title || book.lastChapter,
+        chapterIndex: matchChapterIndex(book, list)
       }
       const next = await window.fly.shelf.upsert(updated)
       setShelf(next)
@@ -669,51 +607,18 @@ export default function App() {
     setChapters(book.chapters || [])
     setLoadingContent(true)
     try {
-      let tocUrl = book.tocUrl || book.bookUrl
       let infoChapters = book.chapters
       const isLocal = isLocalBook(book)
       if (!infoChapters?.length && !isLocal) {
-        try {
-          const info = await window.fly.books.info(book.origin, book.bookUrl)
-          tocUrl = info.tocUrl || book.bookUrl
-          infoChapters = await window.fly.books.toc(book.origin, tocUrl)
-          const updated: ShelfBook = {
-            ...withRead,
-            name: pickBookName(info.name, book.name),
-            author: pickBookAuthor(info.author, book.author),
-            coverUrl: info.coverUrl || book.coverUrl,
-            intro: info.intro || book.intro,
-            tocUrl,
-            chapters: infoChapters,
-            lastReadAt: openedAt,
-            updatedAt: Date.now()
-          }
-          const next = await window.fly.shelf.upsert(updated)
-          setShelf(next)
-          setReading(updated)
-          setChapters(infoChapters || [])
-          book = updated
-        } catch (infoErr) {
-          // 详情规则可能损坏；仍用详情 URL 尝试拉目录
-          try {
-            infoChapters = await window.fly.books.toc(book.origin, book.bookUrl)
-            if (!infoChapters?.length) throw infoErr
-            const updated: ShelfBook = {
-              ...withRead,
-              tocUrl: book.bookUrl,
-              chapters: infoChapters,
-              lastReadAt: openedAt,
-              updatedAt: Date.now()
-            }
-            const next = await window.fly.shelf.upsert(updated)
-            setShelf(next)
-            setReading(updated)
-            setChapters(infoChapters)
-            book = updated
-          } catch {
-            throw infoErr
-          }
-        }
+        // 详情失败时 fetchBookDetail 内部已用 bookUrl 兜底拉目录，两者都失败才抛错
+        const detail = await fetchBookDetail(book.origin, book.bookUrl)
+        infoChapters = detail.chapters
+        const updated: ShelfBook = buildShelfBook(book, detail, withRead)
+        const next = await window.fly.shelf.upsert(updated)
+        setShelf(next)
+        setReading(updated)
+        setChapters(infoChapters || [])
+        book = updated
       } else {
         const next = await window.fly.shelf.upsert(withRead)
         setShelf(next)
@@ -768,54 +673,29 @@ export default function App() {
     | { ok: false; message: string }
   > {
     try {
-      let tocUrl = b.bookUrl
-      let chapters: Chapter[] = []
-      let infoName = b.name
-      let infoAuthor = b.author
-      let infoCover = b.coverUrl
-      let infoIntro = b.intro
-      let infoLast = b.lastChapter
-      let infoKind = b.kind
-      try {
-        onStage?.('正在获取书籍详情…')
-        const info = await window.fly.books.info(b.origin, b.bookUrl)
-        tocUrl = info.tocUrl || b.bookUrl
-        infoName = pickBookName(info.name, b.name)
-        infoAuthor = pickBookAuthor(info.author, b.author)
-        infoCover = info.coverUrl || b.coverUrl
-        infoIntro = info.intro || b.intro
-        infoLast = info.lastChapter || b.lastChapter
-        infoKind = info.kind || b.kind
-        onStage?.('正在获取目录…')
-        chapters = await window.fly.books.toc(b.origin, tocUrl)
-      } catch {
-        onStage?.('正在获取目录…')
-        chapters = await window.fly.books.toc(b.origin, b.bookUrl)
-        tocUrl = b.bookUrl
-      }
+      onStage?.('正在获取书籍详情…')
+      const detail = await fetchBookDetail(b.origin, b.bookUrl)
+      onStage?.('正在获取目录…')
+      const chapters = detail.chapters
+      const info = detail.info
+      const infoName = pickBookName(info?.name, b.name)
+      const infoAuthor = pickBookAuthor(info?.author, b.author)
+      const infoCover = info?.coverUrl || b.coverUrl
+      const infoIntro = info?.intro || b.intro
+      const infoLast = info?.lastChapter || b.lastChapter
+      const infoKind = info?.kind || b.kind
       const readable = chapters.filter((c) => c.url && !c.isVolume)
       if (!readable.length) {
         return { ok: false, message: '无法获取目录，书源可能失效或规则不兼容' }
       }
-      const now = Date.now()
       const item: ShelfBook = {
-        id: bookId(b.origin, b.bookUrl),
+        ...buildShelfBook(b, detail, undefined),
         name: infoName,
         author: infoAuthor,
-        bookUrl: b.bookUrl,
         coverUrl: infoCover,
         intro: infoIntro,
         kind: infoKind,
-        lastChapter: infoLast,
-        origin: b.origin,
-        originName: b.originName,
-        tocUrl,
-        chapters,
-        chapterIndex: 0,
-        scrollTop: 0,
-        addedAt: now,
-        updatedAt: now,
-        lastReadAt: now
+        lastChapter: infoLast
       }
       return { ok: true, item }
     } catch (e) {
@@ -915,10 +795,7 @@ export default function App() {
     }
     const refresh = options?.refresh ?? false
     const resetScroll = options?.resetScroll ?? index !== book.chapterIndex
-    const mdDoc =
-      (book.localFormat || '').toLowerCase() === 'md' ||
-      (book.kind || '').toUpperCase() === 'MD' ||
-      (book.kind || '').toUpperCase() === 'MARKDOWN'
+    const mdDoc = isMdBook(book)
 
     // Markdown 全文模式：目录切换只改锚点，正文已在内存则不再重复拉取
     if (
@@ -1272,46 +1149,46 @@ export default function App() {
   // 身份稳定的视图回调包装：仅创建一次，转发到 viewCbRef.current，使 React.memo 真正生效
   const shelfCb = useMemo<Pick<ViewCallbacks, 'onOpen' | 'onImportLocal' | 'onSortChange' | 'onUpdate' | 'onUpdateAll' | 'onChangeSource' | 'onCache' | 'onCancelCache' | 'onExportTxt' | 'onRemove' | 'onSearch'>>(
     () => ({
-      onOpen: (b) => void viewCbRef.current!.onOpen(b),
-      onImportLocal: () => viewCbRef.current!.onImportLocal(),
-      onSortChange: (s) => viewCbRef.current!.onSortChange(s),
-      onUpdate: (b) => void viewCbRef.current!.onUpdate(b),
-      onUpdateAll: () => viewCbRef.current!.onUpdateAll(),
-      onChangeSource: (b) => void viewCbRef.current!.onChangeSource(b),
-      onCache: (b) => void viewCbRef.current!.onCache(b),
-      onCancelCache: (id) => viewCbRef.current!.onCancelCache(id),
-      onExportTxt: (b) => void viewCbRef.current!.onExportTxt(b),
-      onRemove: (id) => void viewCbRef.current!.onRemove(id),
-      onSearch: () => viewCbRef.current!.onSearch()
+      onOpen: (b) => callView((cb) => void cb.onOpen(b)),
+      onImportLocal: () => callView((cb) => cb.onImportLocal()),
+      onSortChange: (s) => callView((cb) => cb.onSortChange(s)),
+      onUpdate: (b) => callView((cb) => void cb.onUpdate(b)),
+      onUpdateAll: () => callView((cb) => cb.onUpdateAll()),
+      onChangeSource: (b) => callView((cb) => void cb.onChangeSource(b)),
+      onCache: (b) => callView((cb) => void cb.onCache(b)),
+      onCancelCache: (id) => callView((cb) => cb.onCancelCache(id)),
+      onExportTxt: (b) => callView((cb) => void cb.onExportTxt(b)),
+      onRemove: (id) => callView((cb) => void cb.onRemove(id)),
+      onSearch: () => callView((cb) => cb.onSearch())
     }),
-    []
+    [callView]
   )
 
   const searchCb = useMemo<Pick<ViewCallbacks, 'onSearch' | 'onSearchKeyword' | 'onClearHistory' | 'onRemoveHistory' | 'onRead'>>(
     () => ({
-      onSearch: () => viewCbRef.current!.onSearchRun(),
-      onSearchKeyword: (k) => viewCbRef.current!.onSearchKeyword(k),
-      onClearHistory: () => viewCbRef.current!.onClearHistory(),
-      onRemoveHistory: (k) => viewCbRef.current!.onRemoveHistory(k),
-      onRead: (b) => void viewCbRef.current!.onRead(b)
+      onSearch: () => callView((cb) => cb.onSearchRun()),
+      onSearchKeyword: (k) => callView((cb) => cb.onSearchKeyword(k)),
+      onClearHistory: () => callView((cb) => cb.onClearHistory()),
+      onRemoveHistory: (k) => callView((cb) => cb.onRemoveHistory(k)),
+      onRead: (b) => callView((cb) => void cb.onRead(b))
     }),
-    []
+    [callView]
   )
 
   const rankCb = useMemo<Pick<ViewCallbacks, 'onRankOpenBook'>>(
     () => ({
-      onRankOpenBook: (name) => viewCbRef.current!.onRankOpenBook(name)
+      onRankOpenBook: (name) => callView((cb) => cb.onRankOpenBook(name))
     }),
-    []
+    [callView]
   )
 
   const sourcesCb = useMemo<Pick<ViewCallbacks, 'onTestKeywordChange' | 'onTestKeywordCommit' | 'onImportFile'>>(
     () => ({
-      onTestKeywordChange: (v) => viewCbRef.current!.onTestKeywordChange(v),
-      onTestKeywordCommit: (v) => viewCbRef.current!.onTestKeywordCommit(v),
-      onImportFile: () => viewCbRef.current!.onImportFile()
+      onTestKeywordChange: (v) => callView((cb) => cb.onTestKeywordChange(v)),
+      onTestKeywordCommit: (v) => callView((cb) => cb.onTestKeywordCommit(v)),
+      onImportFile: () => callView((cb) => cb.onImportFile())
     }),
-    []
+    [callView]
   )
 
   const settingsCb = useMemo<
@@ -1321,12 +1198,12 @@ export default function App() {
     >
   >(
     () => ({
-      onPrefsChange: (p) => void viewCbRef.current!.onPrefsChange(p),
-      onRemovePurify: (r) => void viewCbRef.current!.onRemovePurify(r),
-      onLegacyStatus: () => viewCbRef.current!.onLegacyStatus(),
-      onImportLegacy: () => viewCbRef.current!.onImportLegacy()
+      onPrefsChange: (p) => callView((cb) => void cb.onPrefsChange(p)),
+      onRemovePurify: (r) => callView((cb) => void cb.onRemovePurify(r)),
+      onLegacyStatus: () => callView((cb) => cb.onLegacyStatus()),
+      onImportLegacy: () => callView((cb) => cb.onImportLegacy())
     }),
-    []
+    [callView]
   )
 
   const readerCb = useMemo<
@@ -1344,17 +1221,17 @@ export default function App() {
     >
   >(
     () => ({
-      onBack: () => viewCbRef.current!.onBack(),
-      onSelectChapter: (i) => viewCbRef.current!.onSelectChapter(i),
-      onPrev: () => viewCbRef.current!.onPrev(),
-      onNext: () => viewCbRef.current!.onNext(),
-      onScrollSave: (t) => viewCbRef.current!.onScrollSave(t),
-      onActiveChapter: (i) => viewCbRef.current!.onActiveChapter(i),
-      onSettingsChange: (s) => viewCbRef.current!.onSettingsChange(s),
-      onAddPurify: (t) => void viewCbRef.current!.onAddPurify(t),
-      onReloadChapter: () => viewCbRef.current!.onReloadChapter()
+      onBack: () => callView((cb) => cb.onBack()),
+      onSelectChapter: (i) => callView((cb) => cb.onSelectChapter(i)),
+      onPrev: () => callView((cb) => cb.onPrev()),
+      onNext: () => callView((cb) => cb.onNext()),
+      onScrollSave: (t) => callView((cb) => cb.onScrollSave(t)),
+      onActiveChapter: (i) => callView((cb) => cb.onActiveChapter(i)),
+      onSettingsChange: (s) => callView((cb) => cb.onSettingsChange(s)),
+      onAddPurify: (t) => callView((cb) => void cb.onAddPurify(t)),
+      onReloadChapter: () => callView((cb) => cb.onReloadChapter())
     }),
-    []
+    [callView]
   )
 
   const toastStack = toasts.length ? (
@@ -1526,7 +1403,6 @@ export default function App() {
       {changeSource ? (
         <ChangeSourceDialog
           book={changeSource}
-          sourceCount={enabledCount}
           filterCandidates={(book, hits) =>
             filterChangeSourceCandidates(book, hits).filter(
               (b) => !(b.origin === book.origin && b.bookUrl === book.bookUrl)

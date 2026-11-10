@@ -9,8 +9,8 @@ use regex::Regex;
 use serde_json::{json, Map, Value};
 
 use super::http::{fetch_text, parse_request_url, resolve_url, FetchOptions};
-use super::rules::{content_rule_as_html, get_elements, get_string};
-use super::text::{ensure_novel_paragraphs, normalize_line_endings};
+use super::rules::{content_rule_as_html, get_elements, get_elements_detailed, get_string};
+use super::text::{ensure_novel_paragraphs, normalize_line_endings, strip_unclosed_script_style};
 
 /// 目录分页上限，与原版一致
 const MAX_TOC_PAGES: usize = 30;
@@ -152,6 +152,11 @@ pub fn html_to_novel_text(raw: &str) -> String {
         .map(|re| re.is_match(&s))
         .unwrap_or(false)
     {
+        // 先去掉无闭合 <script>/<style> 及其后内容：正则 `<script>.*?</script>`
+        // 匹配不到无闭合标签，会把脚本正文残留在正文里（见 text.rs）。
+        // 局限：其余剥标签仍用正则，对畸形嵌套/属性里含 `>` 的标签可能处理不准；
+        // 这里只产纯文本段落，不执行脚本，残留只影响排版。
+        s = strip_unclosed_script_style(&s);
         for (pattern, replacement) in [
             (r"(?is)<(script|style)[^>]*>.*?</\1>", ""),
             (r"(?is)<!--.*?-->", ""),
@@ -205,14 +210,21 @@ pub async fn search_books(source: &Value, key: &str, page: u32) -> Result<Vec<Va
     let mut vars = HashMap::new();
     vars.insert("key".to_string(), key.to_string());
     vars.insert("page".to_string(), page.to_string());
-    let (url, options) = parse_request_url(search_url, &vars);
+    let (url, options) = parse_request_url(search_url, &vars)?;
     let full_url = resolve_url(base, &url);
 
     let page_result = fetch_text(&full_url, &merge_headers(options, &headers)).await?;
     let text = page_result.text;
     let final_url = page_result.final_url;
 
-    let items = get_elements(&text, Some(book_list_rule));
+    // 列表规则解析失败时透传首个失败原因（而不是返回空列表让测试只报“无结果”）：
+    // test_source 的 message 会带上它。
+    let (items, list_diag) = get_elements_detailed(&text, Some(book_list_rule));
+    if items.is_empty() {
+        if let Some(diag) = list_diag {
+            return Err(format!("书源规则解析失败：{diag}"));
+        }
+    }
     let mut books = Vec::new();
     for item in items {
         let content = wrap_item(&item);
@@ -232,6 +244,9 @@ pub async fn search_books(source: &Value, key: &str, page: u32) -> Result<Vec<Va
                 &final_url
             )),
         );
+        // bookUrl 转绝对地址（已是绝对地址时 resolve_url 原样返回）。
+        // 注意：规则解密出的章节/封面地址最终都要经过 fetch_text 入口的
+        // validate_fetch_url 复检（SSRF 校验），未经校验的 URL 不会发出请求。
         book.insert("bookUrl".into(), json!(resolve_url(&final_url, &book_url_raw)));
         for (field, rule) in [
             ("coverUrl", "coverUrl"),
@@ -240,7 +255,12 @@ pub async fn search_books(source: &Value, key: &str, page: u32) -> Result<Vec<Va
             ("lastChapter", "lastChapter"),
             ("wordCount", "wordCount"),
         ] {
-            let val = get_string(&content, str_field(source, &["ruleSearch", rule]), &final_url);
+            let mut val = get_string(&content, str_field(source, &["ruleSearch", rule]), &final_url);
+            // coverUrl 一律转绝对地址：JSON 模式返回相对路径是封面丢失的成因之一
+            // （@src 的 CSS 模式已在 get_from_element 里转过，resolve 后不变）。
+            if field == "coverUrl" {
+                val = resolve_url(&final_url, &val);
+            }
             if !val.is_empty() {
                 book.insert(field.into(), json!(val));
             }
@@ -324,7 +344,11 @@ pub async fn get_book_info(source: &Value, book_url: &str) -> Result<Value, Stri
     info.insert("author".into(), json!(if author.is_empty() { "佚名" } else { &author }));
     info.insert("bookUrl".into(), json!(&base));
     for field in ["coverUrl", "intro", "kind", "lastChapter", "wordCount"] {
-        let val = pick(field);
+        let mut val = pick(field);
+        // coverUrl 一律转绝对地址（与 search_books 一致，JSON 模式相对路径会丢封面）。
+        if field == "coverUrl" {
+            val = resolve_url(&base, &val);
+        }
         if !val.is_empty() {
             info.insert(field.into(), json!(val));
         }
@@ -366,13 +390,16 @@ pub async fn get_chapter_list_with_budget(
 
     let mut chapters: Vec<Value> = Vec::new();
     let mut next: Option<String> = Some(toc_url.to_string());
+    // 与正文循环一致：nextTocUrl 见过的地址不再请求，A→B→A 循环不要跑满 30 页。
+    let mut seen_toc: Vec<String> = Vec::new();
     let mut guard = 0usize;
 
     while let Some(url) = next.take() {
-        if guard >= MAX_TOC_PAGES {
+        if guard >= MAX_TOC_PAGES || seen_toc.contains(&url) {
             break;
         }
         guard += 1;
+        seen_toc.push(url.clone());
 
         let options = FetchOptions {
             headers: headers.clone(),
@@ -428,7 +455,8 @@ pub async fn get_chapter_list_with_budget(
             } else {
                 Some(resolve_url(&base, &n))
             };
-            next = resolved.filter(|u| u != &base);
+            // 已请求过的目录页不再跟随（与循环头的 seen 检查配合，防 A→B→A）。
+            next = resolved.filter(|u| !seen_toc.contains(u));
         }
     }
 
@@ -464,6 +492,8 @@ pub async fn get_content(source: &Value, chapter_url: &str) -> Result<String, St
             headers: headers.clone(),
             ..Default::default()
         };
+        // 章节地址可能来自 @js 解密（如 java 桥解密出的 URL），
+        // fetch_text 入口会用 validate_fetch_url 复检（SSRF 校验），不合规直接报错。
         let fetched = fetch_text(&url, &options).await?;
         let base = fetched.final_url.clone();
         let mut html = fetched.text;

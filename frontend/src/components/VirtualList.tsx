@@ -47,11 +47,19 @@ function MeasuredUnit({
   onMeasure: (key: string | number, height: number) => void
 }) {
   const ref = useRef<HTMLDivElement | null>(null)
+  // 每项挂 ResizeObserver：内容/字体/容器变宽导致行高变化时重测，不再只量一次
   useLayoutEffect(() => {
     const el = ref.current
     if (!el) return
-    const h = el.getBoundingClientRect().height
-    if (h > 0) onMeasure(unitKey, h)
+    const measure = () => {
+      const h = el.getBoundingClientRect().height
+      if (h > 0) onMeasure(unitKey, h)
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
   }, [unitKey, onMeasure])
   return (
     <div
@@ -104,11 +112,18 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
   const getItemKeyRef = useRef(getItemKey)
   getItemKeyRef.current = getItemKey
 
+  const prevWidthRef = useRef(0)
   useEffect(() => {
     const el = scrollerRef.current
     if (!el) return
     const sync = () => {
       setViewportHeight(el.clientHeight)
+      // 容器变宽会改变换行/行高：使高度缓存失效，待各单元重测后恢复
+      if (prevWidthRef.current && el.clientWidth !== prevWidthRef.current) {
+        heightsRef.current.clear()
+        setHeightsTick((n) => n + 1)
+      }
+      prevWidthRef.current = el.clientWidth
       setContentWidth(el.clientWidth)
     }
     sync()
@@ -122,13 +137,23 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
   }, [])
 
   /** 滚动时通过 requestAnimationFrame 节流更新 scrollTop，避免整棵 VirtualList 每帧重渲染 */
-  let scrollRaf = 0
+  const scrollRafRef = useRef(0)
   const onScroll = useCallback(() => {
     const el = scrollerRef.current
     if (!el) return
-    if (scrollRaf) cancelAnimationFrame(scrollRaf)
-    scrollRaf = requestAnimationFrame(() => setScrollTop(el.scrollTop))
+    if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0
+      setScrollTop(el.scrollTop)
+    })
   }, [])
+  // 卸载时取消待处理的滚动 rAF，避免对已卸载组件 setState
+  useEffect(
+    () => () => {
+      if (scrollRafRef.current) cancelAnimationFrame(scrollRafRef.current)
+    },
+    []
+  )
 
   /** 实测高度回调：仅在高度变化（>0.5px）时更新，避免无谓重渲染 */
   const onMeasure = useCallback((key: string | number, h: number) => {
@@ -146,17 +171,20 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
 
   /** 前缀和高度（offsets），用于二分定位可见区间 */
   const offsets = useMemo(() => {
+    // heightsTick 是高度变化的重算触发器（体内引用，避免 lint 误报多余依赖）
+    void heightsTick
     const arr = new Array(unitCount + 1)
     arr[0] = 0
     const gk = getItemKeyRef.current
     for (let i = 0; i < unitCount; i++) {
-      const key = grid ? `band-${i}` : gk ? gk(i) : i
+      // 网格行带 key 包含列数：列数变化时旧行高不复用（同一行带装的条目数变了）
+      const key = grid ? `band-${columns}-${i}` : gk ? gk(i) : i
       const h = heightsRef.current.get(key) ?? estimateSize
       arr[i + 1] = arr[i] + h + (i < unitCount - 1 ? gap : 0)
     }
     return arr
     // heightsTick 触发重算；getItemKey 通过 ref 稳定化，不再作为依赖
-  }, [unitCount, estimateSize, gap, grid, heightsTick])
+  }, [unitCount, estimateSize, gap, grid, columns, heightsTick])
 
   const totalHeight = offsets[unitCount] ?? 0
 
@@ -213,7 +241,7 @@ export const VirtualList = forwardRef<VirtualListHandle, VirtualListProps>(funct
 
   const units: ReactNode[] = []
   for (let i = start; i < end; i++) {
-    const unitKey = grid ? `band-${i}` : getItemKey ? getItemKey(i) : i
+    const unitKey = grid ? `band-${columns}-${i}` : getItemKey ? getItemKey(i) : i
     const offset = offsets[i]
     units.push(
       <MeasuredUnit key={unitKey} unitKey={unitKey} offset={offset} onMeasure={onMeasure}>

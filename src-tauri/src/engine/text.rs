@@ -118,9 +118,39 @@ fn split_by_regex(text: &str, pattern: &str) -> Vec<String> {
     }
 }
 
+/// 去掉未闭合 `<script>` / `<style>` 及其后的全部内容。
+/// 浏览器会把无闭合脚本标签之后的内容都当作脚本正文，而正则
+/// `<script[^>]*>.*?</script>` 匹配不到无闭合标签，会把脚本正文残留在正文里。
+/// 有闭合标签时不动（由后续的正则/解析处理），只修无闭合这一种情况。
+pub(crate) fn strip_unclosed_script_style(s: &str) -> String {
+    let lower = s.to_ascii_lowercase();
+    for tag in ["script", "style"] {
+        let open_pat = format!("<{tag}");
+        let close_pat = format!("</{tag}>");
+        let mut search_from = 0usize;
+        while let Some(rel) = lower[search_from..].find(&open_pat) {
+            let open = search_from + rel;
+            match lower[open..].find(&close_pat) {
+                Some(_) => {
+                    // 该处有闭合标签，继续找下一个开始标签
+                    search_from = open + open_pat.len();
+                }
+                None => {
+                    // 无闭合：从该标签起截断，后面全是脚本/样式正文
+                    return s[..open].to_string();
+                }
+            }
+        }
+    }
+    s.to_string()
+}
+
 /// 去掉 HTML 结构标签但保留换行语义，对应 ensureNovelParagraphs 里的四次 replace。
 fn strip_html_shape(s: &str) -> String {
-    let mut out = s.to_string();
+    // 先处理无闭合 script/style（见 strip_unclosed_script_style）。
+    // 局限：其余剥标签仍用正则，对畸形嵌套/属性里含 `>` 的标签可能处理不准；
+    // 正文最终以纯文本段落呈现，残留标签只影响排版、不执行脚本。
+    let mut out = strip_unclosed_script_style(s);
     for (pattern, replacement) in [
         // 脚本与样式整块丢弃（含其后一个闭合标签由非贪婪匹配保证）
         (r"(?is)<(script|style)[^>]*>.*?</\1>", ""),
@@ -275,6 +305,16 @@ mod tests {
     fn truncated_short_lines_are_merged() {
         let got = ensure_novel_paragraphs("少年抬起头\n望向远方的山峰。");
         assert_eq!(got, "少年抬起头望向远方的山峰。");
+    }
+
+    #[test]
+    fn unclosed_script_does_not_leak_its_body() {
+        // 无闭合 <script>：其后内容是脚本正文，必须整段去掉，不能残留在正文里
+        let got = ensure_novel_paragraphs("第一段。<script>var x=1; alert(2);");
+        assert_eq!(got, "第一段。");
+        // 有闭合标签时仍按原逻辑整块去掉（脚本块不产生段落分隔）
+        let got = ensure_novel_paragraphs("第一段。<script>var x=1;</script>第二段。");
+        assert_eq!(got, "第一段。第二段。");
     }
 
     #[test]

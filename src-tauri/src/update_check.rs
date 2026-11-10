@@ -12,8 +12,8 @@ const APP_NAME: &str = "FlyReader";
 const GITEE_OWNER: &str = "wucc513721";
 const GITEE_REPO: &str = "flyreader";
 const RELEASES_URL: &str = "https://gitee.com/wucc513721/flyreader/releases";
-/// 兜底版本号（`APP_ABOUT.version`）：主进程版本为空时使用。
-const FALLBACK_VERSION: &str = "1.1.0";
+/// 兜底版本号：取 Cargo 包版本，不再写死 "1.1.0"（发版改 Cargo.toml 后自动跟上）。
+const FALLBACK_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// 原版用 Electron net 无超时；这里给一个上限，避免关于页一直转圈。
 const REQUEST_TIMEOUT_SECS: u64 = 15;
 
@@ -32,17 +32,50 @@ fn parse_int_loose(segment: &str) -> i64 {
     digits.parse::<i64>().unwrap_or(0)
 }
 
-fn version_parts(version: &str) -> Vec<i64> {
-    normalize_version(version)
-        .split(['.', '+', '-'])
-        .map(parse_int_loose)
-        .collect()
+/// 拆出 semver 三段：先剥离 +build 元数据，再按第一个 '-' 分出 prerelease。
+/// 例："1.2.3-beta.1+build.5" → ([1, 2, 3], ["beta", "1"])。
+fn split_semver(version: &str) -> (Vec<i64>, Vec<String>) {
+    let normalized = normalize_version(version);
+    let no_build = normalized.split('+').next().unwrap_or("");
+    let (core, pre) = match no_build.split_once('-') {
+        Some((c, p)) => (c, p),
+        None => (no_build, ""),
+    };
+    let core_parts: Vec<i64> = core.split('.').map(parse_int_loose).collect();
+    let pre_parts: Vec<String> = if pre.is_empty() {
+        Vec::new()
+    } else {
+        pre.split('.').map(str::to_string).collect()
+    };
+    (core_parts, pre_parts)
 }
 
-/// 按数字段比较两个版本号，a>b 为正、a<b 为负、相等为 0，对应 compareVersions。
+/// prerelease 按点分段比较：数字段按数字比，数字段 < 字母段，字母段按字典比，
+/// 一方是另一方前缀时段数少的更小（semver 11 条规则）。
+fn compare_prerelease(a: &[String], b: &[String]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x == y {
+            continue;
+        }
+        let ordering = match (x.parse::<i64>().ok(), y.parse::<i64>().ok()) {
+            (Some(nx), Some(ny)) => nx.cmp(&ny),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => x.cmp(y),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+/// 按 semver 比较两个版本号，a>b 为正、a<b 为负、相等为 0：
+/// 先比核心数字段；无后缀 > 有后缀；都有后缀时按 prerelease 规则比。
 pub fn compare_versions(a: &str, b: &str) -> i64 {
-    let pa = version_parts(a);
-    let pb = version_parts(b);
+    let (pa, prea) = split_semver(a);
+    let (pb, preb) = split_semver(b);
     let len = pa.len().max(pb.len());
     for i in 0..len {
         let x = pa.get(i).copied().unwrap_or(0);
@@ -51,7 +84,27 @@ pub fn compare_versions(a: &str, b: &str) -> i64 {
             return x - y;
         }
     }
-    0
+    use std::cmp::Ordering;
+    match (prea.is_empty(), preb.is_empty()) {
+        (true, true) => 0,
+        (true, false) => 1, // 正式版 > 预发布版：1.0.0 > 1.0.0-beta
+        (false, true) => -1,
+        (false, false) => match compare_prerelease(&prea, &preb) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        },
+    }
+}
+
+/// Gitee 返回的 html_url 必须是本仓库的 releases 链接才采信，否则回退到自行拼接的
+/// 地址，避免上游返回外站/异仓库链接被直接打开。
+fn is_valid_release_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed.host_str() == Some("gitee.com")
+        && parsed.path().starts_with("/wucc513721/flyreader/releases/")
 }
 
 /// `encodeURIComponent`：字母数字与 `-_.!~*'()` 不转义。
@@ -126,7 +179,7 @@ fn release_to_result(status: u16, body: &str, current: &str) -> Value {
     }
 
     let html_url = text_of("html_url");
-    let release_url = if !html_url.is_empty() {
+    let release_url = if is_valid_release_url(&html_url) {
         html_url
     } else {
         format!("{RELEASES_URL}/tag/{}", encode_uri_component(&latest_raw))
@@ -250,14 +303,34 @@ mod tests {
             "tag_name": "v1.2.0",
             "name": "1.2.0",
             "body": "  修复导入  \n",
-            "html_url": "https://gitee.com/x/releases/v1.2.0"
+            "html_url": "https://gitee.com/wucc513721/flyreader/releases/tag/v1.2.0"
         })
         .to_string();
         let r = release_to_result(200, &body, "1.1.0");
         assert_eq!(r["status"], json!("available"));
         assert_eq!(r["latestVersion"], json!("1.2.0"));
-        assert_eq!(r["releaseUrl"], json!("https://gitee.com/x/releases/v1.2.0"));
+        assert_eq!(r["releaseUrl"], json!("https://gitee.com/wucc513721/flyreader/releases/tag/v1.2.0"));
         assert_eq!(r["releaseNotes"], json!("修复导入"));
+
+        // html_url 不是本仓库的 releases 链接（异仓库/外站）时，回退到自行拼接的地址
+        let foreign = json!({
+            "tag_name": "v1.2.0",
+            "html_url": "https://gitee.com/x/releases/v1.2.0"
+        })
+        .to_string();
+        assert_eq!(
+            release_to_result(200, &foreign, "1.1.0")["releaseUrl"],
+            json!(format!("{RELEASES_URL}/tag/v1.2.0"))
+        );
+        let offsite = json!({
+            "tag_name": "v1.2.0",
+            "html_url": "https://example.com/evil"
+        })
+        .to_string();
+        assert_eq!(
+            release_to_result(200, &offsite, "1.1.0")["releaseUrl"],
+            json!(format!("{RELEASES_URL}/tag/v1.2.0"))
+        );
 
         // tag 无 html_url 时回退到 releases/tag/<encoded>
         let no_url = json!({ "tag_name": "v1.2.0 测试" }).to_string();
@@ -268,6 +341,25 @@ mod tests {
 
         let older = json!({ "tag_name": "v1.0.9" }).to_string();
         assert_eq!(release_to_result(200, &older, "1.1.0")["status"], json!("upToDate"));
+    }
+
+    #[test]
+    fn prerelease_comparison_follows_semver() {
+        // 正式版 > 预发布版
+        assert!(compare_versions("1.0.0", "1.0.0-beta") > 0);
+        assert!(compare_versions("1.0.0-beta", "1.0.0") < 0);
+        // 预发布段按点分段：alpha < alpha.1 < alpha.beta < beta < beta.2 < beta.11 < rc.1
+        assert!(compare_versions("1.0.0-alpha", "1.0.0-alpha.1") < 0);
+        assert!(compare_versions("1.0.0-alpha.1", "1.0.0-alpha.beta") < 0);
+        assert!(compare_versions("1.0.0-alpha.beta", "1.0.0-beta") < 0);
+        assert!(compare_versions("1.0.0-beta.2", "1.0.0-beta.11") < 0);
+        assert!(compare_versions("1.0.0-beta.11", "1.0.0-rc.1") < 0);
+        // 数字段按数字比，不是按字典比：beta.2 < beta.11
+        // +build 元数据不参与比较
+        assert_eq!(compare_versions("1.0.0-beta.1+build.5", "1.0.0-beta.1"), 0);
+        assert_eq!(compare_versions("1.0.0+build.1", "1.0.0+build.2"), 0);
+        // 核心段不同时 prerelease 不影响大小关系
+        assert!(compare_versions("1.0.1-beta", "1.0.0") > 0);
     }
 
     /// 真实 Gitee Releases 接口验证（网络相关，`cargo test` 默认跳过）：

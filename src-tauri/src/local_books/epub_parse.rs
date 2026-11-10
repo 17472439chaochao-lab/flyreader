@@ -1,5 +1,12 @@
 //! EPUB 导入：container.xml → OPF → spine / 目录 → 章节正文与封面
 //! （对应 main/localBooks/epubParse.ts）。
+//!
+//! zip 依赖决策（2026-11-10，见 PROJECT.md 末尾）：保持 `zip 0.6.6` 不动，
+//! 未升级到 9.x——本机 VM 无 cargo，无法编译验证大版本升级；
+//! 0.6.6 已知的 advisory 涉及 `extract()` / AES 解密入口，本项目未调用这两个入口
+//! （只用 `ZipArchive::new` / `by_name` / `by_index_raw` 读条目），
+//! 且已有条目数/解压总量/压缩比三重 zip bomb 防护；待在有 Rust 工具链的机器上
+//! 验证通过后再升级，不要为了升级而破坏 EPUB 解析。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -13,6 +20,7 @@ use sxd_document::dom::{ChildOfElement as XmlChild, ChildOfRoot as XmlRootChild,
 use sxd_document::Package;
 use zip::ZipArchive;
 
+use super::txt_split::decode_txt_buffer;
 use super::SplitChapter;
 
 /// zip bomb 防护上限（对合法 EPUB 足够宽松，对恶意压缩包直接拒绝）。
@@ -53,6 +61,18 @@ struct ManifestItem {
 
 /// 解析 EPUB 缓冲，提取书名、作者、章节正文与可选封面。
 pub fn parse_epub_buffer(bytes: &[u8], fallback_title: &str) -> Result<EpubMeta, String> {
+    parse_epub_buffer_with_cancel(bytes, fallback_title, None)
+}
+
+/// 带取消标志的 EPUB 解析：`cancel` 被置位时返回 Err("导入已取消")；
+/// 章节数超 10000 或正文累计超 200MB 时返回 Err（见 local_books::MAX_*）。
+/// 旧 parse_epub_buffer 是无取消的包装（A 路超时后调 parsing.abort()，
+/// 这里的取消标志是第二道防线）。
+pub fn parse_epub_buffer_with_cancel(
+    bytes: &[u8],
+    fallback_title: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<EpubMeta, String> {
     let mut archive =
         ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("无效的 EPUB：无法解压（{e}）"))?;
     guard_zip_bomb(&mut archive)?;
@@ -119,7 +139,12 @@ pub fn parse_epub_buffer(bytes: &[u8], fallback_title: &str) -> Result<EpubMeta,
         .collect();
 
     let mut chapters: Vec<SplitChapter> = Vec::new();
+    let mut total_chapter_bytes: usize = 0;
     for id in &spine_ids {
+        // 章节循环中定期检查取消标志（A 路超时 abort 后的第二道防线）
+        if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err("导入已取消".to_string());
+        }
         if nav_ids.iter().any(|n| n == id) {
             continue;
         }
@@ -137,6 +162,19 @@ pub fn parse_epub_buffer(bytes: &[u8], fallback_title: &str) -> Result<EpubMeta,
             continue;
         }
         let guess = chapter_title_guess(&toc_titles, &html, &item.href, chapters.len());
+        total_chapter_bytes += content.len();
+        if chapters.len() + 1 > super::MAX_CHAPTERS {
+            return Err(format!(
+                "章节数超过上限（{} 章），已拒绝导入",
+                super::MAX_CHAPTERS
+            ));
+        }
+        if total_chapter_bytes > super::MAX_TOTAL_CHAPTER_BYTES {
+            return Err(format!(
+                "章节正文累计超过上限（{}MB），已拒绝导入",
+                super::MAX_TOTAL_CHAPTER_BYTES / (1024 * 1024)
+            ));
+        }
         chapters.push(SplitChapter::new(truncate(&guess, 80), content));
     }
 
@@ -656,7 +694,30 @@ fn read_entry_bytes(archive: &mut Archive<'_>, path: &str, max_bytes: usize) -> 
 
 fn read_entry_text(archive: &mut Archive<'_>, path: &str, max_bytes: usize) -> Option<String> {
     let buf = read_entry_bytes(archive, path, max_bytes)?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some(decode_entry_text(&buf))
+}
+
+/// EPUB 条目解码：不要 `from_utf8_lossy` 一刀切。
+/// 先按 XML 声明的 encoding（如 `<?xml version="1.0" encoding="GBK"?>`）选解码器；
+/// 无声明或声明的编码不可用时，复用 TXT 的 BOM + 前 64KB 小样本编码探测。
+fn decode_entry_text(buf: &[u8]) -> String {
+    if let Some(label) = xml_declared_encoding(buf) {
+        if let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+            let (cow, _, _) = enc.decode(buf);
+            return cow.into_owned();
+        }
+    }
+    decode_txt_buffer(buf)
+}
+
+/// 从条目头部（前 512 字节）取 XML 声明里的 encoding。
+fn xml_declared_encoding(buf: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&buf[..buf.len().min(512)]).into_owned();
+    let re = regex_of(r#"(?i)<\?xml[^>]*encoding\s*=\s*["']([^"']+)["']"#)?;
+    re.captures(&head)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -768,6 +829,23 @@ mod tests {
             .cover_data_url
             .as_deref()
             .is_some_and(|url| url.starts_with("data:image/jpeg;base64,")));
+    }
+
+    #[test]
+    fn entry_text_uses_xml_declared_encoding_not_lossy() {
+        // GBK 编码的章节 + XML 声明 encoding="GBK"：不要 from_utf8_lossy 一刀切
+        let body = "第一章 起\n正文甲。";
+        let (cow, _, _) = encoding_rs::GBK.encode(body);
+        let mut buf = b"<?xml version=\"1.0\" encoding=\"GBK\"?><html><body><p>".to_vec();
+        buf.extend_from_slice(&cow);
+        buf.extend_from_slice(b"</p></body></html>");
+        let decoded = decode_entry_text(&buf);
+        assert!(decoded.contains(body), "解码结果：{decoded}");
+        assert!(!decoded.contains('\u{FFFD}'), "不应出现替换符：{decoded}");
+        // 无声明时复用 TXT 探测：UTF-8 BOM 正常解码
+        let mut buf = vec![0xef, 0xbb, 0xbf];
+        buf.extend_from_slice("第一章".as_bytes());
+        assert_eq!(decode_entry_text(&buf), "第一章");
     }
 
     #[test]

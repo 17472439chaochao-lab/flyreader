@@ -1,7 +1,9 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useDeferredValue, useEffect, useMemo, useState } from 'react'
 import { isLocalBook } from '@shared/bookLocal'
 import { isSourceStructuralOk } from '@shared/sourceValidity'
+import { parseBookSourceJson } from '@shared/validate'
 import {
+  compareSourcesForSearch,
   sourceMatchLabel,
   sourceMatchStrength,
   sourceMatchTier,
@@ -86,6 +88,8 @@ export const SourcesView = memo(function SourcesView({
   >('all')
   /** 书源搜索关键词（匹配名称 / 地址 / 分组 / 测试信息） */
   const [query, setQuery] = useState('')
+  // 书源筛选输入用 useDeferredValue 防抖式节流：输入即时回显，过滤用滞后值，避免每键重排大列表
+  const deferredQuery = useDeferredValue(query)
   /** 是否处于多选模式 */
   const [selectMode, setSelectMode] = useState(false)
   /** 已勾选的书源 URL */
@@ -137,7 +141,7 @@ export const SourcesView = memo(function SourcesView({
   }, [sources])
 
   const filteredSources = useMemo(() => {
-    const keyword = query.trim().toLowerCase()
+    const keyword = deferredQuery.trim().toLowerCase()
     const list = sources.filter((s) => {
       if (keyword) {
         const hay = [s.bookSourceName, s.bookSourceUrl, s.bookSourceGroup, s.flyTestMessage]
@@ -163,13 +167,14 @@ export const SourcesView = memo(function SourcesView({
           return true
       }
     })
+    // 排序改调共享比较器 compareSourcesForSearch（匹配强度 → 速度 → 延迟），
+    // 同分时再按名称兜底；此前内联排序只比了匹配强度
     return list.slice().sort((a, b) => {
-      const d =
-        sourceMatchStrength(b, shelfCountByOrigin) - sourceMatchStrength(a, shelfCountByOrigin)
+      const d = compareSourcesForSearch(a, b, shelfCountByOrigin)
       if (d !== 0) return d
       return (a.bookSourceName || '').localeCompare(b.bookSourceName || '', 'zh')
     })
-  }, [sources, filter, shelfCountByOrigin, query])
+  }, [sources, filter, shelfCountByOrigin, deferredQuery])
 
   /** 当前显示（搜索 + 分类筛选后）的书源 URL，作为「全选」的作用范围 */
   const visibleUrls = useMemo(
@@ -454,13 +459,14 @@ export const SourcesView = memo(function SourcesView({
       showToast('书源名称不能为空')
       return
     }
+    // 手写 JSON 先过关键字段与类型校验，校验通过才入库
+    const checked = parseBookSourceJson(editText, name)
+    if (!checked.ok) {
+      showToast(checked.message)
+      return
+    }
     try {
-      const parsed = JSON.parse(editText) as BookSource
-      parsed.bookSourceName = name
-      if (!parsed.bookSourceUrl?.trim()) {
-        showToast('书源 URL 不能为空')
-        return
-      }
+      const parsed = checked.source
       const next = await window.fly.sources.update(editing.bookSourceUrl, parsed)
       onSourcesChange(next)
       setEditing(null)

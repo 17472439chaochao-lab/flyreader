@@ -38,7 +38,8 @@ const SCHEMA: &str = r#"
     CREATE TABLE IF NOT EXISTS book_covers (
       book_id TEXT PRIMARY KEY,
       mime TEXT NOT NULL,
-      data BLOB NOT NULL
+      data BLOB NOT NULL,
+      source_url TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS chapters (
@@ -121,6 +122,9 @@ pub fn open_db(app_data_dir: &Path) -> Result<Connection, String> {
     conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
     conn.pragma_update(None, "busy_timeout", 5000).map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    // 版本化迁移：user_version < 1 的旧库补 source_url 列（新库建表已自带该列，
+    // 此时 ALTER 会报 duplicate column，容错跳过；其它错误才返回）。
+    migrate_schema_v1(&conn)?;
     if let Some(src) = inherited_from {
         set_meta(&conn, "legacy_inherited_from", &src.to_string_lossy());
         set_meta(&conn, "legacy_inherited_at", &now_ms().to_string());
@@ -134,6 +138,32 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or(std::time::Duration::ZERO)
         .as_millis() as i64
+}
+
+/// schema 版本 1：book_covers 增加 source_url 列（存原始 http(s) 封面地址，
+/// 封面 blob 丢失时可回退到原地址）。已存在该列时容错跳过。
+fn migrate_schema_v1(conn: &Connection) -> Result<(), String> {
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if version >= 1 {
+        return Ok(());
+    }
+    match conn.execute(
+        "ALTER TABLE book_covers ADD COLUMN source_url TEXT NOT NULL DEFAULT ''",
+        [],
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(msg);
+            }
+            // 列已存在（例如新库建表已包含）：跳过即可
+        }
+    }
+    conn.pragma_update(None, "user_version", 1)
+        .map_err(|e| e.to_string())
 }
 
 fn get_meta(conn: &Connection, key: &str) -> Option<String> {
@@ -218,8 +248,14 @@ fn migrate_legacy_chapters(conn: &Connection, app_data_dir: &Path) {
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     })();
-    if result.is_ok() && archive_after {
-        let _ = fs::rename(&legacy_path, app_data_dir.join("chapters.sqlite.migrated.bak"));
+    if result.is_ok() {
+        if archive_after {
+            let _ = fs::rename(&legacy_path, app_data_dir.join("chapters.sqlite.migrated.bak"));
+        }
+        // 成功标志只在真正迁移成功时写：失败时不写，下次启动会重试，
+        // 避免失败也被标记为已迁移而永久丢数据。
+        set_meta(conn, "migrated_chapters_sqlite", "1");
+    } else if let Err(e) = &result {
+        eprintln!("[fly-reader] 旧章节库迁移失败，下次启动重试：{e}");
     }
-    set_meta(conn, "migrated_chapters_sqlite", "1");
 }

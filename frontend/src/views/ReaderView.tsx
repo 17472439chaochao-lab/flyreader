@@ -1,6 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { authorName } from '@shared/author'
-import { isLocalBook } from '@shared/bookLocal'
+import { isLocalBook, isMdBook } from '@shared/bookLocal'
 import { applyPurify } from '@shared/purify'
 import { ensureNovelParagraphs } from '@shared/novelText'
 import { cssFontFamily, platformDefaultFontFamily, primaryFontFamily } from '@shared/fonts'
@@ -22,10 +22,25 @@ import {
 
 const CHAPTER_ROW_HEIGHT = 36
 
-function isMdBook(book: Pick<ShelfBook, 'localFormat' | 'kind'>): boolean {
-  const fmt = (book.localFormat || '').toLowerCase()
-  const kind = (book.kind || '').toUpperCase()
-  return fmt === 'md' || kind === 'MD' || kind === 'MARKDOWN'
+const PARAGRAPH_CHUNK_SIZE = 100
+
+/** 简单内容哈希（FNV-1a 32 位），供段落稳定 key 使用，避免 key={i} 全量重建 */
+function chunkHash(text: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
+}
+
+/** 长章节按段落分块渲染（每块 100 段），React 只重建变化的块 */
+function chunkParagraphs(paragraphs: string[]): string[][] {
+  const out: string[][] = []
+  for (let i = 0; i < paragraphs.length; i += PARAGRAPH_CHUNK_SIZE) {
+    out.push(paragraphs.slice(i, i + PARAGRAPH_CHUNK_SIZE))
+  }
+  return out
 }
 
 /**
@@ -458,6 +473,7 @@ export const ReaderView = memo(function ReaderView({
       window.clearTimeout(t3)
     }
     // 故意不依赖 book.scrollTop：用户滚动保存进度时不应把正文拽回去
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loading, content, book.id, book.chapterIndex, mdMode, mdAnchor, chapter?.title])
 
   useEffect(() => {
@@ -483,7 +499,7 @@ export const ReaderView = memo(function ReaderView({
           <IconToc />
         </button>
       ) : null}
-      <aside className="reader-toc" aria-hidden={!tocOpen}>
+      <aside className="reader-toc" aria-hidden={!tocOpen} ref={(el) => { if (el) el.inert = !tocOpen }}>
         <div className="reader-toc-panel">
           <header data-tauri-drag-region="deep">
             <div className="reader-toc-head">
@@ -753,7 +769,13 @@ export const ReaderView = memo(function ReaderView({
                 e.preventDefault()
                 e.stopPropagation()
                 if (href.startsWith('#')) {
-                  const id = decodeURIComponent(href.slice(1))
+                  // 非法 % 序列（如 %#%）时 decodeURIComponent 会抛错：兜底用原始片段
+                  let id: string
+                  try {
+                    id = decodeURIComponent(href.slice(1))
+                  } catch {
+                    id = href.slice(1)
+                  }
                   const box = scrollRef.current
                   const target = box?.querySelector(
                     `#${CSS.escape(id)}`
@@ -802,8 +824,13 @@ export const ReaderView = memo(function ReaderView({
               }}
             >
               <h1>{cleanTitle(chapter?.title || book.name)}</h1>
-              {paragraphs.map((para, i) => (
-                <p key={i}>{para}</p>
+              {chunkParagraphs(paragraphs).map((chunk, ci) => (
+                <div key={`chunk-${ci}-${chunkHash(chunk[0])}`} className="reader-chunk">
+                  {chunk.map((para, i) => (
+                    // 稳定 key：段落内容哈希 + 块内序号，正文微改不触发全章重建
+                    <p key={`${chunkHash(para)}-${i}`}>{para}</p>
+                  ))}
+                </div>
               ))}
             </article>
           )}

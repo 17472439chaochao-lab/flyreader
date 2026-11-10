@@ -3,6 +3,7 @@ import { memo } from 'react'
 import { authorLabel } from '@shared/author'
 import type { SearchBook, SearchProgress } from '@shared/types'
 import { IconClose, IconTrash, SearchIcon } from '../components/icons'
+import { SafeCover } from '../components/SafeCover'
 import { VirtualList } from '../components/VirtualList'
 
 /**
@@ -157,11 +158,7 @@ export const SearchView = memo(function SearchView({
               const b = results[i]
               return (
                 <button type="button" className="book-card" onClick={() => onRead(b)}>
-                  {b.coverUrl ? (
-                    <img className="cover" src={b.coverUrl} alt="" />
-                  ) : (
-                    <div className="cover placeholder">{b.name.slice(0, 1)}</div>
-                  )}
+                  <SafeCover src={b.coverUrl} title={b.name} />
                   <div className="book-meta">
                     <h3>{b.name}</h3>
                     <p>{authorLabel(b.author)}</p>

@@ -1,7 +1,7 @@
 {
   "name": "fly-reader",
   "productName": "FlyReader",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "FlyReader 轻量小说阅读器（Tauri 2 迁移版）：本地 TXT/EPUB/Markdown、在线搜索阅读与导出，兼容 Legado 书源",
   "private": true,
   "type": "module",
@@ -12,7 +12,9 @@
     "dev": "node scripts/tauri-cli.mjs dev",
     "build": "node scripts/tauri-cli.mjs build",
     "build:win": "node scripts/tauri-cli.mjs build --bundles nsis",
-    "icons": "node scripts/tauri-cli.mjs icon src-tauri/app-icon.png"
+    "icons": "node scripts/tauri-cli.mjs icon src-tauri/app-icon.png",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
   },
   "dependencies": {
     "@mantine/core": "^8.3.18",
@@ -31,6 +33,14 @@
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.3",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8",
+    "jsdom": "^25.0.1",
+    "@testing-library/react": "^16.0.1",
+    "eslint": "^9.18.0",
+    "prettier": "^3.4.2",
+    "@eslint/js": "^9.18.0",
+    "typescript-eslint": "^8.21.0",
+    "eslint-plugin-react-hooks": "^5.1.0"
   }
 }

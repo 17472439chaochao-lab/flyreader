@@ -1,20 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 import { Loader } from '@mantine/core'
 import { authorLabel } from '@shared/author'
-import type { SearchBook, SearchProgress, ShelfBook } from '@shared/types'
+import type { SearchBook, ShelfBook } from '@shared/types'
+import { useBookSearch } from '../hooks/useBookSearch'
+import { SafeCover } from './SafeCover'
 
 /**
  * 换源对话框（独立组件，不复用 Mantine Modal）。
  *
  * 设计目标：面板尺寸在「搜索中 / 结果列表 / 正在换源」三个阶段保持完全一致，
  * 阶段切换只换内部内容，不改变面板高度——从根上消除竖向跳动。
- * 自身负责搜索、进度订阅、候选合并与应用，对外只暴露 book + 回调。
+ * 搜索由 useBookSearch（与 App 搜书共用）负责：代际守卫 + 流式 rAF 合批；
+ * 自身只负责候选展示与应用，对外只暴露 book + 回调。
  */
 
 export type ChangeSourceDialogProps = {
   book: ShelfBook
-  /** 可用的书源数量（决定进度条总数） */
-  sourceCount: number
   /** 过滤候选（排除当前源等），由外部提供以保持单一实现 */
   filterCandidates: (book: ShelfBook, hits: SearchBook[]) => SearchBook[]
   /** 把候选应用到书架（替换原书），成功后调用 onClose */
@@ -25,104 +26,30 @@ export type ChangeSourceDialogProps = {
 /** 面板固定尺寸：三个阶段共用，杜绝高度跳变 */
 const PANEL_W = 460
 const PANEL_H = 440
-const LIST_MAX_H = 300
 
 export function ChangeSourceDialog({
   book,
-  sourceCount,
   filterCandidates,
   apply,
   onClose
 }: ChangeSourceDialogProps) {
-  const [candidates, setCandidates] = useState<SearchBook[]>([])
-  const [progress, setProgress] = useState<SearchProgress | null>(null)
-  const [searching, setSearching] = useState(true)
   const [applying, setApplying] = useState<SearchBook | null>(null)
   const [error, setError] = useState<string | null>(null)
-
-  /** 对话框实例代号：忽略过期事件（搜索被新对话框或关闭取代） */
-  const genRef = useRef(0)
-  /** 候选去重池 */
-  const seenRef = useRef<Set<string>>(new Set())
+  const filterRef = useRef(filterCandidates)
+  filterRef.current = filterCandidates
+  const bookRef = useRef(book)
+  bookRef.current = book
+  /** 搜索由共享 Hook 负责（代际守卫 + rAF 队列合批，不再双份实现） */
+  const { results: candidates, searching, progress, runSearch } = useBookSearch({
+    filterHits: (_key, hits) => filterRef.current(bookRef.current, hits)
+  })
 
   useEffect(() => {
-    const gen = ++genRef.current
-    seenRef.current = new Set()
-    setCandidates([])
-    setProgress({ done: 0, total: sourceCount, found: 0, current: '', phase: 'start' })
-    setSearching(true)
-
-    let unlistProgress: (() => void) | null = null
-    let unlistPartial: (() => void) | null = null
-
-    const isStale = () => gen !== genRef.current
-
-    /** 合并中间命中：去重 + 排除当前源，rAF 拆帧避免同帧批量 DOM 插入 */
-    let pendingFrame: number | null = null
-    const mergeHits = (hits: SearchBook[]) => {
-      const filtered = filterCandidates(book, hits)
-      if (!filtered.length) return
-      if (pendingFrame !== null) return
-      pendingFrame = requestAnimationFrame(() => {
-        pendingFrame = null
-        if (isStale()) return
-        setCandidates((prev) => {
-          const next = prev.slice()
-          for (const h of filtered) {
-            const id = `${h.origin}::${h.bookUrl}`
-            if (seenRef.current.has(id)) continue
-            seenRef.current.add(id)
-            next.push(h)
-          }
-          return next.length === prev.length ? prev : next
-        })
-      })
-    }
-
-    unlistProgress = window.fly.books.onSearchProgress((p) => {
-      if (isStale()) return
-      setProgress(p)
+    setError(null)
+    void runSearch(book.name).catch((e: Error) => {
+      setError(`搜索失败：${e.message}`)
     })
-    unlistPartial = window.fly.books.onSearchPartial((hits) => {
-      if (isStale()) return
-      mergeHits(hits)
-    })
-
-    window.fly.books
-      .search(book.name)
-      .then(({ books }) => {
-        if (isStale()) return
-        const final = filterCandidates(book, books)
-        setCandidates((prev) => {
-          const seen = new Set(prev.map((c) => `${c.origin}::${c.bookUrl}`))
-          const extra = final.filter((c) => !seen.has(`${c.origin}::${c.bookUrl}`))
-          if (!extra.length) return prev
-          const next = prev.slice()
-          for (const c of extra) {
-            const id = `${c.origin}::${c.bookUrl}`
-            if (!seen.has(id)) {
-              seen.add(id)
-              next.push(c)
-            }
-          }
-          return next
-        })
-        setProgress(null)
-        setSearching(false)
-      })
-      .catch((e: Error) => {
-        if (isStale()) return
-        setError(`搜索失败：${e.message}`)
-        setProgress(null)
-        setSearching(false)
-      })
-
-    return () => {
-      genRef.current += 1
-      unlistProgress?.()
-      unlistPartial?.()
-      if (pendingFrame !== null) cancelAnimationFrame(pendingFrame)
-    }
+    // 只在对话框打开（book.id 变化）时触发一次搜索
   }, [book.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   /** 选中候选应用：面板保持，内部切到「正在换源…」状态 */
@@ -227,11 +154,7 @@ export function ChangeSourceDialog({
 function CsdRow({ c, onClick }: { c: SearchBook; onClick: () => void }) {
   return (
     <button className="csd-row" onClick={onClick}>
-      {c.coverUrl ? (
-        <img className="csd-cover" src={c.coverUrl} alt="" loading="lazy" />
-      ) : (
-        <div className="csd-cover placeholder">{c.name.slice(0, 1)}</div>
-      )}
+      <SafeCover src={c.coverUrl} title={c.name} className="csd-cover" placeholderClassName="csd-cover placeholder" />
       <div className="csd-meta">
         <strong>{c.name}</strong>
         <span>{authorLabel(c.author)}</span>

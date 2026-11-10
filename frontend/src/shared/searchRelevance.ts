@@ -7,7 +7,7 @@ export function normalizeSearchText(raw?: string | null): string {
   return (raw || '')
     .toLowerCase()
     .replace(/[\s\u3000]+/g, '')
-    .replace(/[《》〈〉「」『』【】〔〕\[\]]/g, '')
+    .replace(/[《》〈〉「」『』【】〔〕[\]]/g, '')
     .replace(/[（）()·・．.。，,、：:；;！!？?""''"'|｜\-—_~～…]/g, '')
     .replace(
       /(精校版|无删减版?|完结版?|完本|全本|最新章节|全文阅读|txt|epub|mobi|azw3|vip)/gi,
@@ -181,38 +181,4 @@ export function dedupeSearchBooks<T extends { origin: string; bookUrl: string }>
     out.push(b)
   }
   return out
-}
-
-/**
- * 根据某书源一次搜索的原始结果与过滤结果，打出 0～100 匹配质量分。
- * 空结果或全是垃圾结果时分数偏低，使嘈杂书源优先级下降。
- * @param keyword 搜索关键词
- * @param raw 过滤前的原始命中
- * @param filtered 相关度过滤后的命中
- * @returns 0～100 的整数匹配分
- */
-export function scoreSearchMatchSample(
-  keyword: string,
-  raw: { name?: string }[],
-  filtered: { name?: string }[]
-): number {
-  if (!raw.length) return 0
-  if (!filtered.length) return 8
-  const sims = filtered.map((b) => titleSimilarity(keyword, b.name || ''))
-  const best = Math.max(...sims)
-  const avg = sims.reduce((s, n) => s + n, 0) / sims.length
-  const precision = filtered.length / raw.length
-  return Math.round(100 * (0.5 * best + 0.3 * avg + 0.2 * precision))
-}
-
-/**
- * 用指数移动平均更新 flyMatchScore。
- * @param prev 历史匹配分，可为空
- * @param sample 本次采样分
- * @returns 钳制在 0～100 的新分数
- */
-export function blendMatchScore(prev: number | undefined, sample: number): number {
-  const next = Math.max(0, Math.min(100, Math.round(sample)))
-  if (prev == null || !Number.isFinite(prev)) return next
-  return Math.round(Math.max(0, Math.min(100, prev)) * 0.65 + next * 0.35)
 }

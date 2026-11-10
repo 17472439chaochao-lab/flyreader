@@ -70,21 +70,56 @@ fn sanitize_title(t: &str) -> String {
 
 /// 将 TXT 全文按标题行切分为章节；命中过少时按体积切分。
 pub fn split_txt_chapters(raw: &str, fallback_title: &str) -> Vec<SplitChapter> {
+    split_txt_chapters_with_cancel(raw, fallback_title, None).unwrap_or_default()
+}
+
+/// 带取消标志与上限检查的切章：`cancel` 被置位时返回 Err("导入已取消")；
+/// 章节数超 10000 或正文累计超 200MB 时返回 Err（见 local_books::MAX_*）。
+/// 旧 split_txt_chapters 是无取消的包装（A 路超时后调 parsing.abort()，
+/// 这里的取消标志是第二道防线）。
+pub fn split_txt_chapters_with_cancel(
+    raw: &str,
+    fallback_title: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<SplitChapter>, String> {
+    let is_cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+    let check_caps = |chapters: &[SplitChapter]| -> Result<(), String> {
+        if chapters.len() > super::MAX_CHAPTERS {
+            return Err(format!(
+                "章节数超过上限（{} 章），已拒绝导入",
+                super::MAX_CHAPTERS
+            ));
+        }
+        let total: usize = chapters.iter().map(|c| c.content.len()).sum();
+        if total > super::MAX_TOTAL_CHAPTER_BYTES {
+            return Err(format!(
+                "章节正文累计超过上限（{}MB），已拒绝导入",
+                super::MAX_TOTAL_CHAPTER_BYTES / (1024 * 1024)
+            ));
+        }
+        Ok(())
+    };
     let normalized = normalize_line_endings(raw);
     let text = strip_bom(&normalized).trim().to_string();
     if text.is_empty() {
-        return vec![SplitChapter::new(
+        return Ok(vec![SplitChapter::new(
             fallback_or(fallback_title, "全文"),
             "（文件为空）",
-        )];
+        )]);
     }
 
     let lines: Vec<&str> = text.split('\n').collect();
     let Some(re) = heading_re() else {
-        return split_by_size(&text, fallback_or(fallback_title, "全文"));
+        let parts = split_by_size(&text, fallback_or(fallback_title, "全文"));
+        check_caps(&parts)?;
+        return Ok(parts);
     };
     let mut hits: Vec<(usize, String)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
+        // 长文件逐行扫描时定期检查取消标志
+        if i % 1024 == 0 && is_cancelled() {
+            return Err("导入已取消".to_string());
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.chars().count() > MAX_HEADING_LEN {
             continue;
@@ -106,7 +141,9 @@ pub fn split_txt_chapters(raw: &str, fallback_title: &str) -> Vec<SplitChapter> 
     let use_hits = if strong.len() >= 3 { strong } else { hits };
 
     if use_hits.len() < 2 {
-        return split_by_size(&text, fallback_or(fallback_title, "全文"));
+        let parts = split_by_size(&text, fallback_or(fallback_title, "全文"));
+        check_caps(&parts)?;
+        return Ok(parts);
     }
 
     let mut chapters: Vec<SplitChapter> = Vec::new();
@@ -118,6 +155,9 @@ pub fn split_txt_chapters(raw: &str, fallback_title: &str) -> Vec<SplitChapter> 
     }
 
     for i in 0..use_hits.len() {
+        if is_cancelled() {
+            return Err("导入已取消".to_string());
+        }
         let start = use_hits[i].0 + 1;
         let end = if i + 1 < use_hits.len() {
             use_hits[i + 1].0
@@ -130,12 +170,13 @@ pub fn split_txt_chapters(raw: &str, fallback_title: &str) -> Vec<SplitChapter> 
     }
 
     if chapters.is_empty() {
-        return vec![SplitChapter::new(
+        return Ok(vec![SplitChapter::new(
             fallback_or(fallback_title, "全文"),
             text,
-        )];
+        )]);
     }
-    chapters
+    check_caps(&chapters)?;
+    Ok(chapters)
 }
 
 /// 按固定体积切分长文本为多章（对应 splitBySize，切点回退到换行）。
@@ -170,6 +211,10 @@ fn split_by_size(text: &str, title: &str) -> Vec<SplitChapter> {
 }
 
 /// 检测编码并解码 TXT 缓冲（UTF-8 / UTF-16 BOM / GB18030 / GBK 等）。
+/// 先用前 64KB 小样本给各候选编码打分定编码，再用胜出的编码单次解码全文：
+/// 不要 5 个候选全量并行解码（大文件会同时产生 5 份全文 String）。
+/// 注意：样本尾部可能截断一个多字节字符，lossy 解码会在此处产生一个替换符，
+/// 对打分影响极小；同分时严格 `>` 比较保留排在前面的 UTF-8（与原版顺序一致）。
 pub fn decode_txt_buffer(buf: &[u8]) -> String {
     if buf.len() >= 3 && buf[..3] == [0xef, 0xbb, 0xbf] {
         return String::from_utf8_lossy(&buf[3..]).into_owned();
@@ -181,26 +226,24 @@ pub fn decode_txt_buffer(buf: &[u8]) -> String {
         return decode_utf16(&buf[2..], false);
     }
 
-    let utf8 = String::from_utf8_lossy(buf).into_owned();
-    let mut cands: Vec<(f64, String)> = vec![(score_decoded_text(&utf8), utf8.clone())];
-    for label in ["gb18030", "gbk", "gb2312", "big5"] {
+    let sample = &buf[..buf.len().min(64 * 1024)];
+    let mut best_label = "utf-8";
+    let mut best_score = f64::NEG_INFINITY;
+    for label in ["utf-8", "gb18030", "gbk", "gb2312", "big5"] {
         let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) else {
             continue;
         };
-        let (cow, _, _) = enc.decode(buf);
-        let text = cow.into_owned();
-        cands.push((score_decoded_text(&text), text));
+        let (cow, _, _) = enc.decode(sample);
+        let score = score_decoded_text(&cow);
+        if score > best_score {
+            best_score = score;
+            best_label = label;
+        }
     }
-    // 稳定排序 + 分数降序：同分时保留 UTF-8 候选（与原版 cands 顺序一致）
-    cands.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    cands
-        .into_iter()
-        .next()
-        .map(|(_, text)| text)
-        .unwrap_or(utf8)
+    let enc = encoding_rs::Encoding::for_label(best_label.as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let (cow, _, _) = enc.decode(buf);
+    cow.into_owned()
 }
 
 /// 把字节流按 UTF-16（默认小端）解码，非法序列换成替换符。
@@ -305,6 +348,19 @@ mod tests {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
         assert_eq!(decode_txt_buffer(&bytes), "第一章 甲\n正文。\n");
+    }
+
+    #[test]
+    fn cancelled_split_returns_error() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(true);
+        let err = split_txt_chapters_with_cancel("第一章 起\n正文。\n第二章 承\n正文。\n", "示例", Some(&flag))
+            .unwrap_err();
+        assert!(err.contains("取消"), "{err}");
+        // 未置位时正常切章
+        let flag = AtomicBool::new(false);
+        let parts = split_txt_chapters_with_cancel("第一章 起\n正文。\n第二章 承\n正文。\n", "示例", Some(&flag)).unwrap();
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]

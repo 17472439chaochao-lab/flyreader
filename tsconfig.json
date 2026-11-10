@@ -6,6 +6,9 @@
     "lib": ["ES2021", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
@@ -18,5 +21,5 @@
     },
     "types": ["vite/client", "node"]
   },
-  "include": ["frontend/src/**/*", "frontend/shared/**/*", "vite.config.ts"]
+  "include": ["frontend/src/**/*", "vite.config.ts"]
 }

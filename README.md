@@ -2,7 +2,7 @@
 
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://gitee.com/wucc513721/flyreader)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![version](https://img.shields.io/badge/version-v1.1.0-blueviolet)](https://gitee.com/wucc513721/flyreader/releases)
+[![version](https://img.shields.io/badge/version-v1.2.0-blueviolet)](https://gitee.com/wucc513721/flyreader/releases)
 [![stack](https://img.shields.io/badge/UI-Tauri%202%20%2B%20React%20%2B%20Rust-orange)](https://gitee.com/wucc513721/flyreader)
 
 轻量桌面小说阅读器，支持导入 **Legado（阅读）** 文本书源，提供搜索、书架、离线缓存与阅读设置。
@@ -238,6 +238,13 @@ A: 数据固定在 `Application Support/com.flyreader.desktop`。旧版数据在
 
 ## 更新记录
 
+- **2026-11-10 · v1.2.0** — 安全与稳定性修复版
+  - 修锁毒化：`store()` 毒化时恢复，`prepare().unwrap()` 改为错误传播
+  - 修 SSRF：请求入口校验 scheme/host/IP，重定向限 5 跳，响应流式限长 12MB
+  - 修任务取消：取消真正生效，`sources_test_all` / `shelf_update_all` / `books_search` / 导出均可取消
+  - 修书架封面重启丢失：封面下载到本地存库，相对路径转绝对地址，存失败保留原地址、还原失败回退原地址
+  - 修本地导入内存：Markdown 不再每章克隆整文，TXT 先小样本定编码，导入超时显式取消
+  - 前端：DOMPurify 显式 allowlist + CSP 收紧，App.tsx 拆出 `useBookSearch`，虚拟列表行高重测，新增 vitest（28 个用例）与 CI
 - **2026-09-29 · v1.1.0** — Tauri 2 重写版（FlyReader）
   - 主进程整体迁移到 Rust：存储、Legado 引擎、本地书导入、书架长任务、检查更新
   - 界面复用旧版 React 渲染层，经 `window.fly` 垫片调用 Tauri 命令

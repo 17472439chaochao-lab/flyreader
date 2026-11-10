@@ -16,6 +16,8 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 pub struct BossState {
     pub hidden: AtomicBool,
     pub registered: Mutex<String>,
+    /// 注销+注册整个换键序列的互斥锁：两次 prefs 保存并发时不互相顶掉对方的键
+    pub swap_lock: Mutex<()>,
 }
 
 impl BossState {
@@ -65,20 +67,66 @@ pub fn on_shortcut_event(app: &AppHandle, state: ShortcutState) {
     }
 }
 
+/// 校验老板键组合：空、单键、退出/关闭类组合一律拒绝。
+/// 返回 Err 时是给前端看的中文原因。
+fn validate_boss_key(accel: &str) -> Result<(), String> {
+    let trimmed = accel.trim();
+    if trimmed.is_empty() {
+        return Err("快捷键不能为空".to_string());
+    }
+    let parts: Vec<&str> = trimmed
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return Err(
+            "快捷键至少需要两个键组合（例如 CommandOrControl+Shift+H），单键容易误触"
+                .to_string(),
+        );
+    }
+    let lower: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
+    let has_cmd_or_ctrl = lower.iter().any(|p| {
+        matches!(
+            p.as_str(),
+            "command" | "cmd" | "control" | "ctrl" | "commandorcontrol"
+        )
+    });
+    let has_alt = lower
+        .iter()
+        .any(|p| matches!(p.as_str(), "alt" | "option"));
+    let has_other_modifier = lower.iter().any(|p| {
+        matches!(p.as_str(), "shift" | "alt" | "option" | "super" | "meta")
+    });
+    let key = lower.last().cloned().unwrap_or_default();
+    // 退出/关闭类组合：Cmd+Q（退出应用）、Cmd+W（关窗口）——只有修饰键恰好是
+    // Cmd/Ctrl 时才算（Cmd+Shift+Q 不是退出组合）；Alt+F4（关窗口）有 Alt 即算。
+    if (has_cmd_or_ctrl && !has_other_modifier && (key == "q" || key == "w"))
+        || (has_alt && key == "f4")
+    {
+        return Err("该组合键用于退出或关闭窗口，不能设为老板键".to_string());
+    }
+    Ok(())
+}
+
 /// 按偏好重注册老板键，返回原版的 `{ok,message}` 结构。
 /// 文案与 `registerBossKeyFromPrefs` 逐条一致。
+/// 换键顺序：先注册新键、成功后再注销旧键；注册失败则恢复旧键（重新注册 previous），
+/// 避免旧键已注销、新键又没注册上导致老板键中断。
 pub fn register_from_prefs(app: &AppHandle, prefs: &Value) -> Value {
     let state = app.state::<BossState>();
+    // 注销+注册整个序列加锁，避免两次 prefs 保存并发时互相顶掉对方的键
+    let _guard = state.swap_lock.lock().unwrap_or_else(|e| e.into_inner());
     let previous = state.take_registered();
-    if !previous.is_empty() {
-        let _ = app.global_shortcut().unregister(previous.as_str());
-        state.set_registered("");
-    }
     let enabled = prefs
         .get("bossKeyEnabled")
         .and_then(Value::as_bool)
         .unwrap_or(true);
     if !enabled {
+        if !previous.is_empty() {
+            let _ = app.global_shortcut().unregister(previous.as_str());
+            state.set_registered("");
+        }
         return json!({ "ok": true, "message": "老板键已关闭" });
     }
     let accel = prefs
@@ -87,18 +135,32 @@ pub fn register_from_prefs(app: &AppHandle, prefs: &Value) -> Value {
         .unwrap_or_default()
         .trim()
         .to_string();
-    if accel.is_empty() {
-        return json!({ "ok": false, "message": "快捷键不能为空" });
+    // 校验失败：不动旧键，旧键继续生效
+    if let Err(msg) = validate_boss_key(&accel) {
+        return json!({ "ok": false, "message": msg });
+    }
+    if accel == previous {
+        return json!({ "ok": true, "message": format!("老板键已启用：{accel}") });
     }
     match app.global_shortcut().register(accel.as_str()) {
         Ok(()) => {
+            if !previous.is_empty() {
+                let _ = app.global_shortcut().unregister(previous.as_str());
+            }
             state.set_registered(&accel);
             json!({ "ok": true, "message": format!("老板键已启用：{accel}") })
         }
-        Err(_) => json!({
-            "ok": false,
-            "message": format!("无法注册快捷键：{accel}（可能被占用）")
-        }),
+        Err(_) => {
+            if !previous.is_empty() {
+                // 旧键从未注销，重新注册一次只是兜底（已注册时会失败，忽略即可）
+                let _ = app.global_shortcut().register(previous.as_str());
+                state.set_registered(&previous);
+            }
+            json!({
+                "ok": false,
+                "message": format!("无法注册快捷键：{accel}（可能被占用），已恢复原老板键")
+            })
+        }
     }
 }
 
@@ -127,5 +189,26 @@ mod tests {
         state.set_registered("");
         assert_eq!(state.take_registered(), "");
         assert!(!state.hidden.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn boss_key_validation_rejects_empty_single_and_dangerous() {
+        assert!(validate_boss_key("").is_err());
+        assert!(validate_boss_key("   ").is_err());
+        // 单键：只有一个按键，没有修饰键组合
+        assert!(validate_boss_key("H").is_err());
+        assert!(validate_boss_key("F1").is_err());
+        // 退出/关闭类组合
+        assert!(validate_boss_key("CommandOrControl+Q").is_err());
+        assert!(validate_boss_key("Command+Q").is_err());
+        assert!(validate_boss_key("Control+Q").is_err());
+        assert!(validate_boss_key("CommandOrControl+W").is_err());
+        assert!(validate_boss_key("Cmd+W").is_err());
+        assert!(validate_boss_key("Alt+F4").is_err());
+        assert!(validate_boss_key("Option+F4").is_err());
+        // 正常组合放行
+        assert!(validate_boss_key("CommandOrControl+Shift+H").is_ok());
+        assert!(validate_boss_key("Alt+Shift+X").is_ok());
+        assert!(validate_boss_key("Control+Shift+Q").is_ok(), "带 Shift 的 Q 不是退出组合");
     }
 }

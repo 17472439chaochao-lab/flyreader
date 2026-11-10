@@ -6,6 +6,9 @@ import type { ConfirmOutcome } from '../components/ConfirmDialog'
  * 将分钟数格式化为中文时长文案。
  * @param minutes 分钟
  */
+/** 护眼提醒「稍后」的 snooze 时长：只扣 10 分钟，不清零累计 */
+const SNOOZE_MS = 10 * 60 * 1000
+
 export function formatEyeCareDuration(minutes: number): string {
   const opt = EYE_CARE_INTERVAL_OPTIONS.find((o) => o.value === minutes)
   if (opt) return opt.label
@@ -94,8 +97,14 @@ export function useEyeCareReminder(opts: {
           confirmText: '知道了',
           cancelText: '稍后'
         })
-        .then(() => {
-          accumulatedMsRef.current = 0
+        .then((outcome) => {
+          // 「稍后」（cancel）只 snooze 10 分钟：累计时长减 10 分钟后继续计时，
+          // 而不是清零重算；「知道了」（confirm）才清零重新累计
+          if (outcome === 'cancel') {
+            accumulatedMsRef.current = Math.max(0, accumulatedMsRef.current - SNOOZE_MS)
+          } else {
+            accumulatedMsRef.current = 0
+          }
           promptingRef.current = false
           lastTickRef.current = null
         })

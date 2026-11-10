@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
-use super::http::{fetch_text, FetchOptions};
+use super::http::{fetch_text, validate_fetch_url, FetchOptions};
 use super::legado::normalize_sources;
 
 /// 内置书源仓库（社区公开维护，按需增删；备用地址优先，备用失败自动回退主地址）
@@ -126,6 +126,8 @@ impl Default for SubRow {
 }
 
 /// 拉取仓库地址文本，带单响应大小上限；超限返回 None。
+/// 流式限长已在 fetch_text 内实现（边读边计、超 12MB 中断），
+/// 此处的事后判断是冗余第二道防线，不再是唯一的限长手段。
 async fn fetch_limited_text(url: &str, timeout_ms: u64) -> Option<String> {
     let page = fetch_text(url, &FetchOptions { timeout_ms: Some(timeout_ms), ..Default::default() })
         .await
@@ -139,12 +141,17 @@ async fn fetch_limited_text(url: &str, timeout_ms: u64) -> Option<String> {
 /// 依次尝试备用/主地址，返回首个成功的响应文本。
 /// 备用地址（alt）多为国内 CDN（jsdelivr / 作者自托管），国内网络环境下优先尝试，
 /// 主地址（GitHub raw）作为海外访问的兜底回退。
+/// 自定义仓库 URL 与订阅子 URL 都先过 validate_fetch_url（SSRF 校验），
+/// 不合规的地址直接跳过（fetch_text 入口还会再检一次）。
 async fn fetch_repo_text(repo: &Repo) -> Option<String> {
     let mut urls = vec![repo.url.as_str()];
     if let Some(alt) = &repo.alt {
         urls.insert(0, alt.as_str());
     }
     for u in urls {
+        if validate_fetch_url(u).is_err() {
+            continue;
+        }
         if let Some(text) = fetch_limited_text(u, REPO_TIMEOUT_MS).await {
             return Some(text);
         }
@@ -238,6 +245,8 @@ async fn fetch_repo(repo: &Repo) -> (Vec<Value>, Vec<String>) {
             if budget.load(Ordering::SeqCst) > MAX_SUB_TOTAL_BYTES {
                 return SubRow::default();
             }
+            // 订阅子 URL 同样走 fetch_text 入口的 validate_fetch_url 校验；
+            // 流式限长也在 fetch_text 内完成，此处事后判断是冗余第二道防线。
             let page = fetch_text(&u, &FetchOptions { timeout_ms: Some(SUB_TIMEOUT_MS), ..Default::default() })
                 .await;
             match page {

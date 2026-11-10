@@ -2,6 +2,7 @@ import { Button, Tabs, Text } from '@mantine/core'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { authorLabel } from '@shared/author'
 import type { RankBoard, RankBook, RankChannel, RankGender } from '@shared/types'
+import { SafeCover } from '../components/SafeCover'
 import { VirtualList, type VirtualListHandle } from '../components/VirtualList'
 
 const CHANNELS: { id: RankChannel; label: string }[] = [
@@ -273,11 +274,7 @@ export const RankView = memo(function RankView({
                   <span className="rank-no" aria-hidden="true">
                     {rankNo}
                   </span>
-                  {b.coverUrl ? (
-                    <img className="cover" src={b.coverUrl} alt="" loading="lazy" />
-                  ) : (
-                    <div className="cover placeholder">{b.name.slice(0, 1)}</div>
-                  )}
+                  <SafeCover src={b.coverUrl} title={b.name} />
                   <div className="book-meta">
                     <h3>{b.name}</h3>
                     <p>{authorLabel(b.author)}</p>

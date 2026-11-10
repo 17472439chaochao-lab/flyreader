@@ -25,10 +25,12 @@ if (existsSync(tsconfig)) {
   }
   run(tscJs, ['--noEmit', '-p', tsconfig])
 } else {
-  console.warn(
-    `未找到 ${tsconfig}，已跳过 tsc 类型检查。` +
+  // tsconfig 缺失不再 warn 后继续构建：缺类型检查的构建不可信，直接失败
+  console.error(
+    `未找到 ${tsconfig}，拒绝继续构建。` +
       '请在仓库根目录执行：git restore --source=origin/main -- tsconfig.json'
   )
+  process.exit(1)
 }
 
 if (!existsSync(viteJs)) {

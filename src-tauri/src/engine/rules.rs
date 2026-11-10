@@ -387,16 +387,33 @@ fn select_by_css<'a>(doc: &'a Html, selector: &str) -> Vec<ElementRef<'a>> {
 }
 
 /// CSS 取值，对应 analyzeCss。
-fn analyze_css(html: &str, rule: &str, base_url: &str, single: bool) -> Vec<String> {
+/// 返回（结果，首个失败原因）：选择器编译失败时给诊断，取空但规则本身合法时诊断为 None。
+fn analyze_css(html: &str, rule: &str, base_url: &str, single: bool) -> (Vec<String>, Option<String>) {
     let parsed = parse_rule_parts_cached(rule);
     if parsed.selector.is_empty() && parsed.get_type == "text" && parsed.regexes.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let doc = Html::parse_document(html);
 
     if parsed.selector.is_empty() || parsed.selector == "@" {
         let val = apply_regex_chain(&element_text(&doc.root_element()), &parsed.regexes);
-        return if val.is_empty() { Vec::new() } else { vec![val] };
+        return if val.is_empty() {
+            (Vec::new(), None)
+        } else {
+            (vec![val], None)
+        };
+    }
+
+    // 选择器编译失败是规则本身的错：不要静默返回空列表，透传诊断给书源测试。
+    if !parsed.selector.starts_with("text.") {
+        let (base, _) = split_trailing_index(&parsed.selector);
+        let css = to_css_selector(&base);
+        if compile_selector(&css).is_none() {
+            return (
+                Vec::new(),
+                Some(format!("CSS 选择器编译失败：{}", parsed.selector)),
+            );
+        }
     }
 
     let mut out = Vec::new();
@@ -410,7 +427,7 @@ fn analyze_css(html: &str, rule: &str, base_url: &str, single: bool) -> Vec<Stri
             }
         }
     }
-    out
+    (out, None)
 }
 
 fn json_value_to_string(item: &Value) -> String {
@@ -443,14 +460,19 @@ fn json_path_selector(selector: &str) -> String {
 }
 
 /// JSONPath 取值，对应 analyzeJson。
-fn analyze_json(content: &str, rule: &str, single: bool) -> Vec<String> {
+fn analyze_json(content: &str, rule: &str, single: bool) -> (Vec<String>, Option<String>) {
     let parsed = parse_rule_parts_cached(rule);
     let Ok(data) = serde_json::from_str::<Value>(content) else {
-        return Vec::new();
+        return (Vec::new(), Some("JSON 解析失败：内容不是合法 JSON".to_string()));
     };
     let found = match jsonpath_plus::find(&jsonpath_of(&json_path_selector(&parsed.selector)), &data) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("JSONPath 求值失败：{}（{}）", parsed.selector, e)),
+            );
+        }
     };
     let mut out = Vec::new();
     for item in found {
@@ -465,7 +487,7 @@ fn analyze_json(content: &str, rule: &str, single: bool) -> Vec<String> {
             }
         }
     }
-    out
+    (out, None)
 }
 
 /// XPath 取值，对应 analyzeXPath。
@@ -473,7 +495,7 @@ fn analyze_json(content: &str, rule: &str, single: bool) -> Vec<String> {
 /// 已知差距：底层 sxd-document 是严格 XML 解析器，而原版用 `@xmldom/xmldom` 的 text/html 模式，
 /// 对未闭合标签的现实 HTML 容错更强。现有 4 个书源均不使用 XPath，故先按 XML 口径实现；
 /// 若之后接入 XPath 书源，需要再加 HTML5→XML 预处理（scraper 树可直接导出 XHTML）。
-fn analyze_xpath(html: &str, rule: &str, base_url: &str, single: bool) -> Vec<String> {
+fn analyze_xpath(html: &str, rule: &str, base_url: &str, single: bool) -> (Vec<String>, Option<String>) {
     let parsed = parse_rule_parts_cached(rule);
     // 取值后缀（@text / @html 等）不属于 XPath 表达式本体
     let expr = if rule.contains("/text()") || rule.contains("/@") {
@@ -483,11 +505,14 @@ fn analyze_xpath(html: &str, rule: &str, base_url: &str, single: bool) -> Vec<St
     };
 
     let Ok(package) = sxd_document::parser::parse(&normalize_for_xml(html)) else {
-        return Vec::new();
+        return (Vec::new(), Some("XPath 文档解析失败：内容不是合法 XML".to_string()));
     };
     let doc = package.as_document();
     let Ok(value) = sxd_xpath::evaluate_xpath(&doc, &expr) else {
-        return Vec::new();
+        return (
+            Vec::new(),
+            Some(format!("XPath 求值失败：{expr}")),
+        );
     };
 
     let mut out = Vec::new();
@@ -511,7 +536,7 @@ fn analyze_xpath(html: &str, rule: &str, base_url: &str, single: bool) -> Vec<St
             }
         }
     }
-    out
+    (out, None)
 }
 
 fn xpath_scalar_to_string(value: &sxd_xpath::Value<'_>) -> String {
@@ -621,58 +646,94 @@ fn normalize_for_xml(html: &str) -> String {
 }
 
 /// 列表规则取元素（bookList / chapterList），对应 getElements。
+/// 失败时只返回空列表（旧行为，调用方不需要诊断时用这个）。
 pub fn get_elements(content: &str, rule: Option<&str>) -> Vec<String> {
+    get_elements_detailed(content, rule).0
+}
+
+/// 列表规则取元素并带诊断：返回（元素 HTML，首个失败原因）。
+/// 规则解析失败（如选择器编译失败、JSON 解析失败、@js 报错）时诊断为 Some，
+/// 书源测试（legado::test_source 经 search_books）会把首个失败原因放进 message，
+/// 而不是只返回空列表让用户猜。
+pub fn get_elements_detailed(content: &str, rule: Option<&str>) -> (Vec<String>, Option<String>) {
     let Some(rule) = rule.filter(|r| !r.trim().is_empty()) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if content.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     match detect_mode(rule, content) {
         Mode::Json => {
             let Ok(data) = serde_json::from_str::<Value>(content) else {
-                return Vec::new();
+                return (Vec::new(), Some("JSON 解析失败：内容不是合法 JSON".to_string()));
             };
             let parsed = parse_rule_parts_cached(rule);
             let path = jsonpath_of(&json_path_selector(&parsed.selector));
             match jsonpath_plus::find(&path, &data) {
-                Ok(found) => found.iter().map(|item| json_value_to_string(item)).collect(),
-                Err(_) => Vec::new(),
+                Ok(found) => (
+                    found.iter().map(|item| json_value_to_string(item)).collect(),
+                    None,
+                ),
+                Err(e) => (
+                    Vec::new(),
+                    Some(format!("JSONPath 求值失败：{path}（{e}）")),
+                ),
             }
         }
         Mode::XPath => {
             let parsed = parse_rule_parts_cached(rule);
             let Ok(package) = sxd_document::parser::parse(&normalize_for_xml(content)) else {
-                return Vec::new();
+                return (Vec::new(), Some("XPath 文档解析失败：内容不是合法 XML".to_string()));
             };
             let doc = package.as_document();
             match sxd_xpath::evaluate_xpath(&doc, &parsed.selector) {
-                Ok(sxd_xpath::Value::Nodeset(set)) => set
-                    .iter()
-                    .filter_map(|n| match n {
-                        sxd_xpath::nodeset::Node::Element(e) => Some(sxd_serialize_element(e)),
-                        sxd_xpath::nodeset::Node::Text(t) => Some(t.text().to_string()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
+                Ok(sxd_xpath::Value::Nodeset(set)) => (
+                    set.iter()
+                        .filter_map(|n| match n {
+                            sxd_xpath::nodeset::Node::Element(e) => Some(sxd_serialize_element(e)),
+                            sxd_xpath::nodeset::Node::Text(t) => Some(t.text().to_string()),
+                            _ => None,
+                        })
+                        .collect(),
+                    None,
+                ),
+                Ok(_) => (Vec::new(), None),
+                Err(_) => (
+                    Vec::new(),
+                    Some(format!("XPath 求值失败：{}", parsed.selector)),
+                ),
             }
         }
-        Mode::Js => eval_js_to_strings(
+        Mode::Js => match eval_js_to_strings(
             &strip_js_prefix(rule),
             JsBindings {
                 result: content,
                 ..Default::default()
             },
-        )
-        .unwrap_or_default(),
+        ) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        },
         Mode::Default => {
             let doc = Html::parse_document(content);
             let parsed = parse_rule_parts_cached(rule);
-            select_by_css(&doc, &parsed.selector)
-                .into_iter()
-                .map(|el| el.html())
-                .collect()
+            if !parsed.selector.starts_with("text.") {
+                let (base, _) = split_trailing_index(&parsed.selector);
+                let css = to_css_selector(&base);
+                if compile_selector(&css).is_none() {
+                    return (
+                        Vec::new(),
+                        Some(format!("CSS 选择器编译失败：{}", parsed.selector)),
+                    );
+                }
+            }
+            (
+                select_by_css(&doc, &parsed.selector)
+                    .into_iter()
+                    .map(|el| el.html())
+                    .collect(),
+                None,
+            )
         }
     }
 }
@@ -703,12 +764,24 @@ fn expand_mustache_rule(content: &str, rule: &str, base_url: &str) -> String {
 }
 
 /// 按规则取字符串列表，支持 `||` 备选与多模式，对应 getStringList。
+/// 失败时只返回空列表（旧行为，调用方不需要诊断时用这个）。
 pub fn get_string_list(content: &str, rule: Option<&str>, base_url: &str, single: bool) -> Vec<String> {
+    get_string_list_detailed(content, rule, base_url, single).0
+}
+
+/// 按规则取字符串列表并带诊断：返回（结果，首个失败原因）。
+/// 所有备选都取空时，诊断为首个备选的失败原因（若有）；规则本身合法但无匹配时诊断为 None。
+pub fn get_string_list_detailed(
+    content: &str,
+    rule: Option<&str>,
+    base_url: &str,
+    single: bool,
+) -> (Vec<String>, Option<String>) {
     let Some(trimmed) = rule.map(str::trim).filter(|r| !r.is_empty()) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     if content.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
 
     // 「左规则@js:代码」/「左规则<js>代码</js>」要先整体切一次：
@@ -716,37 +789,46 @@ pub fn get_string_list(content: &str, rule: Option<&str>, base_url: &str, single
     if let Some((left, code)) = split_js_tail(trimmed) {
         let mid = get_string(content, Some(&left), base_url);
         if mid.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
-        return eval_js_to_strings(
+        return match eval_js_to_strings(
             &code,
             JsBindings {
                 result: &mid,
                 base_url,
                 ..Default::default()
             },
-        )
-        .unwrap_or_default();
+        ) {
+            Ok(v) => (v, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
     }
 
     if trimmed.contains("{{") {
         let expanded = expand_mustache_rule(content, trimmed, base_url).trim().to_string();
-        return if expanded.is_empty() { Vec::new() } else { vec![expanded] };
+        return if expanded.is_empty() {
+            (Vec::new(), None)
+        } else {
+            (vec![expanded], None)
+        };
     }
 
+    let mut first_diag: Option<String> = None;
     for alt in trimmed.split("||") {
-        let out = match detect_mode(alt, content) {
+        let (out, diag) = match detect_mode(alt, content) {
             Mode::Json => analyze_json(content, alt, single),
             Mode::XPath => analyze_xpath(content, alt, base_url, single),
-            Mode::Js => eval_js_to_strings(
+            Mode::Js => match eval_js_to_strings(
                 &strip_js_prefix(alt),
                 JsBindings {
                     result: content,
                     base_url,
                     ..Default::default()
                 },
-            )
-            .unwrap_or_default(),
+            ) {
+                Ok(v) => (v, None),
+                Err(e) => (Vec::new(), Some(e)),
+            },
             Mode::Default => {
                 if is_json_like(content) && alt.trim().starts_with('$') {
                     analyze_json(content, alt, single)
@@ -756,10 +838,13 @@ pub fn get_string_list(content: &str, rule: Option<&str>, base_url: &str, single
             }
         };
         if !out.is_empty() {
-            return out;
+            return (out, None);
+        }
+        if first_diag.is_none() {
+            first_diag = diag;
         }
     }
-    Vec::new()
+    (Vec::new(), first_diag)
 }
 
 /// 按规则取单个字符串（列表首项），对应 getString。
@@ -922,6 +1007,30 @@ mod tests {
             "https://b.example.com/a/x/1.html"
         );
         assert_eq!(get_elements(xml, Some("//span")).len(), 1);
+    }
+
+    #[test]
+    fn rule_failures_carry_a_diagnostic_instead_of_empty_only() {
+        // CSS 选择器编译失败：诊断带出原因，而不是只返回空列表
+        let (out, diag) = get_string_list_detailed(HTML, Some(".bookbox[[["), "", true);
+        assert!(out.is_empty());
+        assert!(diag.is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
+        // JSON 内容配 JSON 规则但路径非法
+        let (out, diag) = get_string_list_detailed("not json", Some("$.data"), "", true);
+        assert!(out.is_empty());
+        assert!(diag.is_some_and(|d| d.contains("JSON")), "diag={diag:?}");
+        // @js 报错同样透传
+        let (out, diag) = get_string_list_detailed(HTML, Some("@js:throw new Error('炸了')"), "", true);
+        assert!(out.is_empty());
+        assert!(diag.is_some_and(|d| d.contains("炸了")), "diag={diag:?}");
+        // 规则合法但无匹配：诊断为 None（不是失败）
+        let (out, diag) = get_string_list_detailed(HTML, Some(".不存在@text"), "", true);
+        assert!(out.is_empty());
+        assert!(diag.is_none(), "diag={diag:?}");
+        // 列表规则同理
+        let (items, diag) = get_elements_detailed(HTML, Some(".bookbox[[["));
+        assert!(items.is_empty());
+        assert!(diag.is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
     }
 
     #[test]

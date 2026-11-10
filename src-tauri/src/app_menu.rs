@@ -27,19 +27,18 @@ const ZOOM_STEP: f64 = 1.2;
 const ZOOM_MIN: f64 = 0.5;
 const ZOOM_MAX: f64 = 2.0;
 
-/// 按菜单项 id 调整缩放，返回新的系数。
+/// 按菜单项 id 调整缩放，返回新的系数；未知 id 返回 None（不要当成缩小）。
 pub fn apply_zoom(app: &AppHandle, id: &str) -> Option<f64> {
     let Some(win) = app.get_webview_window("main") else {
         return None;
     };
     let state = app.state::<ZoomState>();
     let mut guard = state.0.lock().ok()?;
-    let current = if id == ID_ZOOM_RESET {
-        1.0
-    } else if id == ID_ZOOM_IN {
-        (*guard * ZOOM_STEP).min(ZOOM_MAX)
-    } else {
-        (*guard / ZOOM_STEP).max(ZOOM_MIN)
+    let current = match id {
+        ID_ZOOM_RESET => 1.0,
+        ID_ZOOM_IN => (*guard * ZOOM_STEP).min(ZOOM_MAX),
+        ID_ZOOM_OUT => (*guard / ZOOM_STEP).max(ZOOM_MIN),
+        _ => return None,
     };
     *guard = current;
     let _ = win.set_zoom(current);

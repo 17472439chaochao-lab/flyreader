@@ -1040,7 +1040,7 @@ checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
 
 [[package]]
 name = "fly-reader"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "base64 0.22.1",

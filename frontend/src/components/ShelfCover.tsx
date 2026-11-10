@@ -1,5 +1,6 @@
 import { isLocalBook } from '@shared/bookLocal'
 import type { ShelfBook } from '@shared/types'
+import { SafeCover } from './SafeCover'
 
 /**
  * 书架封面展示组件：优先显示网络封面图；
@@ -7,7 +8,8 @@ import type { ShelfBook } from '@shared/types'
  */
 export function ShelfCover({ book }: { book: ShelfBook }) {
   if (book.coverUrl) {
-    return <img className="cover" src={book.coverUrl} alt="" />
+    // 网络封面走 SafeCover：加载失败回落首字占位，不留破图
+    return <SafeCover src={book.coverUrl} title={book.name} />
   }
   const local = isLocalBook(book)
   const fmt = (book.localFormat || '').toLowerCase()

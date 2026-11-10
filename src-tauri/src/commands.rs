@@ -23,7 +23,24 @@ use crate::store::{blend_match_score, is_local_book, now_ms, ChapterRow, Store};
 pub struct StoreState(pub Mutex<Store>);
 
 fn store<'a>(state: &'a State<'_, StoreState>) -> std::sync::MutexGuard<'a, Store> {
-    state.0.lock().unwrap()
+    // 锁毒化只说明上一个持锁线程 panic，Store 本身仍可用：
+    // 用 into_inner() 恢复继续用，绝不要 unwrap() 让整个应用跟着 panic
+    state.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 同上，供返回 Result 的命令用：毒化时恢复而不是报错。
+fn lock_store<'a>(
+    state: &'a State<'_, StoreState>,
+) -> Result<std::sync::MutexGuard<'a, Store>, String> {
+    match state.0.lock() {
+        Ok(g) => Ok(g),
+        Err(poisoned) => Ok(poisoned.into_inner()),
+    }
+}
+
+/// 后台 worker 里取 Store 锁：毒化时同样恢复（worker 里拿不到锁会静默丢写入）。
+fn lock_store_in_worker(mutex: &Mutex<Store>) -> std::sync::MutexGuard<'_, Store> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[tauri::command]
@@ -58,11 +75,23 @@ fn app_apply_zoom(app: AppHandle, action: String) -> Result<Value, String> {
     Ok(json!({ "zoom": crate::app_menu::apply_zoom(&app, id) }))
 }
 
+/// 打开外部链接：只允许 http(s)，且拒绝带用户名/密码的 URL（防止把凭证拼进
+/// 系统 open/xdg-open 的命令行参数里泄露出去）。
+/// 注意：没有用 tauri-plugin-opener——新插件依赖要改 Cargo.toml，本机 VM 无 cargo，
+/// 无法验证新依赖能否编译；擅自加依赖可能破坏构建。现有 std::process::Command
+///（macOS open / Windows cmd start / Linux xdg-open）经上述校验后已够用。
 #[tauri::command]
 async fn app_open_external(url: String) -> Result<Value, String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    let Ok(parsed) = url::Url::parse(url.trim()) else {
+        return Ok(json!({ "ok": false, "message": "链接格式无效" }));
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Ok(json!({ "ok": false, "message": "仅允许打开 http(s) 链接" }));
     }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Ok(json!({ "ok": false, "message": "链接中不能包含用户名或密码" }));
+    }
+    let url = parsed.to_string();
     #[cfg(target_os = "macos")]
     let r = std::process::Command::new("open").arg(&url).status();
     #[cfg(windows)]
@@ -496,6 +525,7 @@ const SOURCE_TEST_TIMEOUT_MS: u64 = 15_000;
 async fn sources_test_all(
     app: AppHandle,
     state: State<'_, StoreState>,
+    jobs: State<'_, JobsState>,
     keyword: Option<String>,
     urls: Option<Vec<String>>,
 ) -> Result<Value, String> {
@@ -515,10 +545,12 @@ async fn sources_test_all(
         (list, s.get_search_history())
     };
     let total = list.len();
+    let flag = jobs.restart(JobKind::TestAll, "all");
     let progress = Arc::new(ProgressEmitter::new(&app, "sources_test_progress", total));
     progress.start(Value::Null);
     if total == 0 {
         progress.finish(Value::Null);
+        jobs.finish(JobKind::TestAll, "all");
         return Ok(Value::Array(store(&state).get_sources()));
     }
 
@@ -534,8 +566,12 @@ async fn sources_test_all(
         let outcomes = Arc::clone(&outcomes);
         let history = history.clone();
         let keyword = keyword.clone();
+        let flag = Arc::clone(&flag);
         handles.push(tauri::async_runtime::spawn(async move {
             loop {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let index = cursor.fetch_add(1, Ordering::Relaxed);
                 if index >= list.len() {
                     break;
@@ -548,9 +584,8 @@ async fn sources_test_all(
                     .to_string();
                 let (url, result) = test_one_source(source, keyword.clone(), history.clone()).await;
                 let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                if let Ok(mut map) = outcomes.lock() {
-                    map.insert(url, result);
-                }
+                // 锁毒化时恢复而不是丢掉本次测试结果
+                outcomes.lock().unwrap_or_else(|e| e.into_inner()).insert(url, result);
                 progress.step(&name, json!({ "ok": ok }));
             }
         }));
@@ -558,9 +593,11 @@ async fn sources_test_all(
     for h in handles {
         let _ = h.await;
     }
-    progress.finish(Value::Null);
+    let cancelled = flag.load(Ordering::Relaxed);
+    jobs.finish(JobKind::TestAll, "all");
+    progress.finish(json!({ "phase": if cancelled { "cancelled" } else { "done" } }));
 
-    let map = outcomes.lock().map(|m| m.clone()).unwrap_or_default();
+    let map = outcomes.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let now = now_ms();
     let next: Vec<Value> = store(&state)
         .get_sources()
@@ -592,6 +629,12 @@ async fn sources_test_all(
     Ok(Value::Array(next))
 }
 
+/// 取消全部书源测试：只置取消标志，由 worker 收尾时 finish（见 shelf_cancel_cache）。
+#[tauri::command]
+fn sources_cancel_test_all(jobs: State<JobsState>) {
+    jobs.cancel(JobKind::TestAll, "all");
+}
+
 #[tauri::command]
 fn sources_remove_invalid(state: State<StoreState>) -> Result<Value, String> {
     let mut s = store(&state);
@@ -621,18 +664,137 @@ fn shelf_list(state: State<StoreState>, jobs: State<JobsState>) -> Vec<Value> {
     enriched_shelf(&mut store(&state), &running)
 }
 
+/// 在线封面下载上限：10 秒超时、最大 2MB、仅 image/*。
+const COVER_DOWNLOAD_TIMEOUT_SECS: u64 = 10;
+const COVER_DOWNLOAD_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// 在线封面本地化用的下载。B 路在 engine::http 里并行实现
+/// fetch_bytes_limited(url, max_bytes)；本机核查时它还不存在，所以这里先用 reqwest
+/// 直写同等逻辑（10 秒超时、最大 2MB、仅 Content-Type 以 image/ 开头），不等 B、
+/// 不阻塞主流程；失败返回 Err，由调用方保留原 URL。
+async fn fetch_cover_bytes(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    let parsed = url::Url::parse(url).map_err(|e| e.to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("仅允许 http(s) 封面地址".to_string());
+    }
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(COVER_DOWNLOAD_TIMEOUT_SECS),
+        reqwest::Client::new().get(url).send(),
+    )
+    .await
+    .map_err(|_| "封面下载超时".to_string())?
+    .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("封面下载失败（HTTP {}）", resp.status()));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
+        .filter(|m| m.starts_with("image/"));
+    let Some(mime) = mime else {
+        return Err("封面 Content-Type 不是图片".to_string());
+    };
+    // 分块读并限流：超 2MB 立即报错，不把整包读进内存
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(COVER_DOWNLOAD_TIMEOUT_SECS),
+            resp.chunk(),
+        )
+        .await
+        .map_err(|_| "封面下载超时".to_string())?
+        .map_err(|e| e.to_string())?;
+        let Some(bytes) = chunk else { break };
+        if buf.len() + bytes.len() > COVER_DOWNLOAD_MAX_BYTES {
+            return Err("封面超过 2MB 上限".to_string());
+        }
+        buf.extend_from_slice(&bytes);
+    }
+    if buf.is_empty() {
+        return Err("封面内容为空".to_string());
+    }
+    Ok((buf, Some(mime)))
+}
+
+/// 在线封面本地化：coverUrl 是 http(s) 且本地还没有对应 blob 时下载封面存进
+/// book_covers（mime、data、source_url=原 URL），并把 coverUrl 换成哨兵；
+/// 已存在 blob 时不重复下载，只把 coverUrl 换成哨兵；下载失败不阻塞，保留原 URL。
+/// 调用方在 upsert/save 之前调它，改完的 book 再落库。
+async fn localize_online_cover(state: &State<'_, StoreState>, book: &mut Value) {
+    let cover = book
+        .get("coverUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if !is_http_url(&cover) {
+        return;
+    }
+    let id = book.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    if id.is_empty() {
+        return;
+    }
+    // 已有 blob：不重复下载，只换哨兵
+    let already_local = lock_store(state)
+        .map(|s| s.has_cover_blob(&id))
+        .unwrap_or(false);
+    if already_local {
+        if let Some(obj) = book.as_object_mut() {
+            obj.insert("coverUrl".into(), json!(format!("flycover://{id}")));
+        }
+        return;
+    }
+    match fetch_cover_bytes(&cover).await {
+        Ok((bytes, mime)) => {
+            let mime = mime.unwrap_or_else(|| "image/jpeg".to_string());
+            let saved = lock_store(state)
+                .and_then(|mut s| s.store_cover_blob(&id, &mime, &bytes, Some(&cover)));
+            if saved.is_ok() {
+                if let Some(obj) = book.as_object_mut() {
+                    obj.insert("coverUrl".into(), json!(format!("flycover://{id}")));
+                }
+            }
+            // 写库失败同样保留原 URL，不阻塞
+        }
+        Err(e) => {
+            eprintln!("封面本地化失败，已保留原 URL：{id} {e}");
+        }
+    }
+}
+
 #[tauri::command]
-fn shelf_upsert(
-    state: State<StoreState>,
-    jobs: State<JobsState>,
+async fn shelf_upsert(
+    state: State<'_, StoreState>,
+    jobs: State<'_, JobsState>,
     book: Value,
 ) -> Result<Vec<Value>, String> {
     let running = jobs.running_ids(JobKind::Cache);
+    let mut book = book;
+    {
+        let mut s = store(&state);
+        s.upsert_shelf_book(&book)?;
+        let origin = book.get("origin").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !origin.is_empty() && !is_local_book(&book) {
+            s.bump_source_match(&origin, 92.0);
+        }
+    }
+    // 在线封面本地化（async 下载）：先落库一次再下载，避免下载期间持锁；
+    // 换成哨兵后再落库一次
+    let before = book
+        .get("coverUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    localize_online_cover(&state, &mut book).await;
+    let after = book
+        .get("coverUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let mut s = store(&state);
-    s.upsert_shelf_book(&book)?;
-    let origin = book.get("origin").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if !origin.is_empty() && !is_local_book(&book) {
-        s.bump_source_match(&origin, 92.0);
+    if after != before {
+        s.upsert_shelf_book(&book)?;
     }
     Ok(enriched_shelf(&mut s, &running))
 }
@@ -956,7 +1118,7 @@ async fn shelf_cache_book(
                 if let Ok(Ok(content)) = fetched {
                     if !content.is_empty() {
                         let state = app.state::<StoreState>();
-                        if let Ok(mut store) = state.0.lock() {
+                        let mut store = lock_store_in_worker(&state.0); {
                             store.set_chapter_content(
                                 &id,
                                 &url,
@@ -995,12 +1157,11 @@ async fn shelf_cache_book(
     Ok(enriched_shelf(&mut store(&state), &running))
 }
 
-/// 取消整本缓存：与原版 abort + cacheJobs.delete 一致，先把登记摘掉，
-/// 书架立刻不再显示「缓存中」；在途 worker 在下一次取章前自行退出。
+/// 取消整本缓存：只把取消标志置 true，不摘登记——在途 worker 在下一次取章前
+/// 自行退出并由收尾处 finish 摘掉登记；这里提前 finish 会让书架误以为任务已结束。
 #[tauri::command]
 fn shelf_cancel_cache(state: State<StoreState>, jobs: State<JobsState>, id: String) -> Vec<Value> {
     jobs.cancel(JobKind::Cache, &id);
-    jobs.finish(JobKind::Cache, &id);
     let running = jobs.running_ids(JobKind::Cache);
     enriched_shelf(&mut store(&state), &running)
 }
@@ -1024,6 +1185,7 @@ async fn shelf_update_all(
         .into_iter()
         .map(|s| (str_of(&s, "bookSourceUrl").to_string(), Arc::new(s)))
         .collect();
+    let flag = jobs.restart(JobKind::UpdateAll, "all");
     let progress = Arc::new(ProgressEmitter::new(&app, "shelf_update_progress", total));
     progress.start(Value::Null);
 
@@ -1038,8 +1200,12 @@ async fn shelf_update_all(
         let slots = Arc::clone(&slots);
         let progress = Arc::clone(&progress);
         let source_map = source_map.clone();
+        let flag = Arc::clone(&flag);
         handles.push(tauri::async_runtime::spawn(async move {
             loop {
+                if flag.load(Ordering::Relaxed) {
+                    break;
+                }
                 let index = cursor.fetch_add(1, Ordering::Relaxed);
                 if index >= total {
                     break;
@@ -1064,10 +1230,13 @@ async fn shelf_update_all(
                     .get("chapters")
                     .and_then(Value::as_array)
                     .is_some_and(|a| !a.is_empty());
-                if let Ok(mut list) = slots.lock() {
-                    if let Some(slot) = list.get_mut(index) {
-                        *slot = Some(result);
-                    }
+                // 锁毒化时恢复而不是丢掉本次更新结果
+                if let Some(slot) = slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(index)
+                {
+                    *slot = Some(result);
                 }
                 progress.step(&name, json!({ "ok": ok }));
             }
@@ -1076,22 +1245,24 @@ async fn shelf_update_all(
     for handle in handles {
         let _ = handle.await;
     }
+    let cancelled = flag.load(Ordering::Relaxed);
+    jobs.finish(JobKind::UpdateAll, "all");
     let updated: Vec<Value> = {
-        let taken = slots.lock().map(|v| v.clone()).unwrap_or_default();
+        let taken = slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
         taken
             .into_iter()
             .enumerate()
             .map(|(i, slot)| slot.unwrap_or_else(|| online[i].clone()))
             .collect()
     };
-    progress.finish(Value::Null);
+    progress.finish(json!({ "phase": if cancelled { "cancelled" } else { "done" } }));
 
     let by_id: HashMap<String, Value> = updated
         .iter()
         .map(|b| (str_of(b, "id").to_string(), b.clone()))
         .collect();
     // 保持书架原有顺序与本地书条目，只替换成功更新过的在线书
-    let outcomes: Vec<Value> = list
+    let mut outcomes: Vec<Value> = list
         .iter()
         .map(|b| {
             by_id
@@ -1100,10 +1271,21 @@ async fn shelf_update_all(
                 .unwrap_or_else(|| b.clone())
         })
         .collect();
+    // 刷新合并后同样走一次在线封面本地化（与 shelf_upsert 同一函数）：逐本下载
+    // http(s) 封面存进 book_covers 并换成哨兵，失败保留原 URL
+    for book in outcomes.iter_mut() {
+        localize_online_cover(&state, book).await;
+    }
     let mut s = store(&state);
     s.save_shelf(&outcomes)?;
     let running = jobs.running_ids(JobKind::Cache);
     Ok(s.enrich_shelf(&outcomes, &running))
+}
+
+/// 取消全架更新：只置取消标志，由 worker 收尾时 finish（见 shelf_cancel_cache）。
+#[tauri::command]
+fn shelf_cancel_update_all(jobs: State<JobsState>) {
+    jobs.cancel(JobKind::UpdateAll, "all");
 }
 
 /// 作者名清洗（对应 shared/author.ts 的 authorName）。
@@ -1198,6 +1380,7 @@ fn build_export_text(book: &Value, chapters: &[Value], contents: &HashMap<String
 async fn shelf_export_txt(
     app: AppHandle,
     state: State<'_, StoreState>,
+    jobs: State<'_, JobsState>,
     id: String,
 ) -> Result<Value, String> {
     let found = store(&state)
@@ -1241,6 +1424,14 @@ async fn shelf_export_txt(
         return Ok(json!({ "ok": false, "message": "没有可导出的章节" }));
     }
     let book_id = str_of(&working, "id").to_string();
+    // 导出登记为可取消任务（JobKind::Export，按 book_id 登记），进度走 shelf_export_progress
+    let flag = jobs.restart(JobKind::Export, &book_id);
+    let progress = Arc::new(ProgressEmitter::new(
+        &app,
+        "shelf_export_progress",
+        chapters.len(),
+    ));
+    progress.start(json!({ "bookId": book_id }));
 
     use tauri_plugin_dialog::DialogExt;
     let default_name = format!("{}.txt", sanitize_file_name(str_of(&working, "name")));
@@ -1252,6 +1443,8 @@ async fn shelf_export_txt(
             .blocking_save_file()
     };
     let Some(path) = picked.and_then(|p| p.into_path().ok()) else {
+        progress.finish(json!({ "bookId": book_id, "phase": "cancelled" }));
+        jobs.finish(JobKind::Export, &book_id);
         return Ok(json!({ "ok": false, "message": "已取消" }));
     };
 
@@ -1264,6 +1457,10 @@ async fn shelf_export_txt(
             match s.get_chapter_content(Some(&book_id), &url) {
                 Some(text) if !text.trim().is_empty() => {
                     contents.insert(url, ensure_novel_paragraphs(&text));
+                    progress.step(
+                        str_of(ch, "title"),
+                        json!({ "bookId": book_id, "cached": true }),
+                    );
                 }
                 _ => missing.push(ch.clone()),
             }
@@ -1287,8 +1484,13 @@ async fn shelf_export_txt(
                 let fetched = Arc::clone(&fetched);
                 let src = Arc::clone(&src);
                 let book_id = book_id.clone();
+                let flag = Arc::clone(&flag);
+                let progress = Arc::clone(&progress);
                 handles.push(tauri::async_runtime::spawn(async move {
                     loop {
+                        if flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let index = cursor.fetch_add(1, Ordering::Relaxed);
                         if index >= total {
                             break;
@@ -1301,37 +1503,54 @@ async fn shelf_export_txt(
                             get_content(&src, &url),
                         )
                         .await;
+                        if flag.load(Ordering::Relaxed) {
+                            break;
+                        }
                         if let Ok(Ok(text)) = outcome {
-                            if text.trim().is_empty() {
-                                continue;
-                            }
-                            let normalized = ensure_novel_paragraphs(&text);
-                            let state = app.state::<StoreState>();
-                            if let Ok(mut store) = state.0.lock() {
-                                store.set_chapter_content(
-                                    &book_id,
-                                    &url,
-                                    &normalized,
-                                    ch.get("index").and_then(Value::as_i64),
-                                    Some(&title),
-                                );
-                            };
-                            if let Ok(mut list) = fetched.lock() {
-                                list.push((url, normalized));
+                            if !text.trim().is_empty() {
+                                let normalized = ensure_novel_paragraphs(&text);
+                                let state = app.state::<StoreState>();
+                                let mut store = lock_store_in_worker(&state.0); {
+                                    store.set_chapter_content(
+                                        &book_id,
+                                        &url,
+                                        &normalized,
+                                        ch.get("index").and_then(Value::as_i64),
+                                        Some(&title),
+                                    );
+                                };
+                                // 锁毒化时恢复而不是丢掉已抓到的章节
+                                fetched
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push((url, normalized));
                             }
                         }
+                        // 无论成功失败都计一步，否则取消/缺章时进度永远到不了 total
+                        progress.step(
+                            &title,
+                            json!({ "bookId": book_id, "cached": false }),
+                        );
                     }
                 }));
             }
             for handle in handles {
                 let _ = handle.await;
             }
-            let list = fetched.lock().map(|v| v.clone()).unwrap_or_default();
+            // 锁毒化时恢复而不是丢掉已抓到的章节
+            let list = fetched.lock().unwrap_or_else(|e| e.into_inner()).clone();
             for (url, body) in list {
                 contents.insert(url, body);
             }
         }
     }
+    let cancelled = flag.load(Ordering::Relaxed);
+    jobs.finish(JobKind::Export, &book_id);
+    if cancelled {
+        progress.finish(json!({ "bookId": book_id, "phase": "cancelled" }));
+        return Ok(json!({ "ok": false, "message": "导出已取消" }));
+    }
+    progress.finish(json!({ "bookId": book_id, "phase": "done" }));
 
     let text = build_export_text(&working, &chapters, &contents);
     let total = chapters.len();
@@ -1362,6 +1581,12 @@ async fn shelf_export_txt(
         "exported": exported,
         "total": total
     }))
+}
+
+/// 取消导出 TXT：只置取消标志，由补抓 worker 收尾时 finish（见 shelf_cancel_cache）。
+#[tauri::command]
+fn shelf_cancel_export(jobs: State<JobsState>, id: String) {
+    jobs.cancel(JobKind::Export, &id);
 }
 
 /// 本地导入解析的超时上限（原版给导入 worker 设的 5 分钟）。
@@ -1443,10 +1668,8 @@ async fn import_local_book(
             content: &r.content,
         })
         .collect();
-    if let Err(msg) = s.replace_chapters(&book_id, &rows) {
-        return json!({ "ok": false, "message": msg });
-    }
-    if let Err(msg) = s.upsert_shelf_book(&book) {
+    // 章节替换 + 书架 upsert 同一事务原子落库（之前两步分开，中途失败会留半截状态）
+    if let Err(msg) = s.replace_chapters_and_upsert(&book_id, &rows, &book) {
         return json!({ "ok": false, "message": msg });
     }
     let shelf = enriched_shelf(&mut s, &jobs.running_ids(JobKind::Cache));
@@ -1519,6 +1742,14 @@ fn data_import_legacy(app: AppHandle, state: State<StoreState>) -> Result<Value,
 enum JobKind {
     Cache,
     Preload,
+    /// 全部书源测试（sources_test_all，全局单例，id 固定为 "all"）
+    TestAll,
+    /// 全架更新（shelf_update_all，全局单例，id 固定为 "all"）
+    UpdateAll,
+    /// 多书源搜索（books_search，全局单例，id 固定为 "all"）
+    Search,
+    /// 导出 TXT（shelf_export_txt，按 book_id 登记）
+    Export,
 }
 
 impl JobKind {
@@ -1526,6 +1757,10 @@ impl JobKind {
         match self {
             JobKind::Cache => "cache",
             JobKind::Preload => "preload",
+            JobKind::TestAll => "test_all",
+            JobKind::UpdateAll => "update_all",
+            JobKind::Search => "search",
+            JobKind::Export => "export",
         }
     }
 }
@@ -1538,11 +1773,17 @@ pub struct JobsState {
 }
 
 impl JobsState {
-    /// 登记新一轮任务并返回其取消标志（同键旧任务视为已被替换）
+    /// 登记新一轮任务并返回其取消标志（同键旧任务视为已被替换）；
+    /// 替换前先把旧 flag 置 true，让在途的旧 worker 在下一次检查点自行退出，
+    /// 而不是悄悄丢弃旧 flag 后还继续跑。
     fn restart(&self, kind: JobKind, id: &str) -> Arc<AtomicBool> {
         let flag = Arc::new(AtomicBool::new(false));
         if let Ok(mut map) = self.flags.lock() {
-            map.insert(format!("{}:{id}", kind.prefix()), flag.clone());
+            let key = format!("{}:{id}", kind.prefix());
+            if let Some(old) = map.get(&key) {
+                old.store(true, Ordering::Relaxed);
+            }
+            map.insert(key, flag.clone());
         }
         flag
     }
@@ -1740,7 +1981,7 @@ async fn books_content(
             }
             // 网络失败时退回任何一书按 URL 命中的缓存，并把它归到当前书
             let fallback = {
-                let store = state.0.lock().map_err(|e| e.to_string())?;
+                let store = lock_store(&state)?;
                 store
                     .get_chapter_content(book_id.as_deref(), &chapter_url)
                     .or_else(|| store.get_chapter_content(None, &chapter_url))
@@ -1786,6 +2027,10 @@ async fn books_preload(
     if book_id.is_empty() {
         return Ok(Vec::new());
     }
+    // 与 shelf_cache_book 的拦截一致：同一本书已有在途预载时直接拒绝，避免重复登记
+    if jobs.is_running(JobKind::Preload, &book_id) {
+        return Err("该书正在预载中".to_string());
+    }
     let Some(source) = source_of(&state, &origin) else {
         return Ok(state
             .0
@@ -1805,7 +2050,7 @@ async fn books_preload(
             .into_iter()
             .filter(|u| !u.is_empty() && !cached_set.contains(u)),
     )));
-    if queue.lock().map_err(|e| e.to_string())?.is_empty() {
+    if queue.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
         return Ok(cached_set.into_iter().collect());
     }
 
@@ -1825,7 +2070,8 @@ async fn books_preload(
                 }
                 // 取任务与抓取之间必须释放队列锁，否则 MutexGuard 会跨 await
                 let url = {
-                    let Ok(mut pending) = queue.lock() else { break };
+                    // 锁毒化时恢复而不是让 worker 退出
+                    let mut pending = queue.lock().unwrap_or_else(|e| e.into_inner());
                     match pending.pop_front() {
                         Some(u) => u,
                         None => break,
@@ -1842,7 +2088,7 @@ async fn books_preload(
                 if let Ok(Ok(content)) = fetched {
                     if !content.is_empty() {
                         let state = app.state::<StoreState>();
-                        if let Ok(mut store) = state.0.lock() {
+                        let mut store = lock_store_in_worker(&state.0); {
                             store.set_chapter_content(&book_id, &url, &content, None, None);
                         };
                     }
@@ -1967,13 +2213,14 @@ async fn rank_qidian_list(
 async fn books_search(
     app: AppHandle,
     state: State<'_, StoreState>,
+    jobs: State<'_, JobsState>,
     keyword: String,
 ) -> Result<Value, String> {
     let key = keyword.trim().to_string();
 
     // 书架在线书数量是排序的强信号（对应 shelfCountByOrigin）
     let shelf_counts: HashMap<String, usize> = {
-        let mut s = state.0.lock().map_err(|e| e.to_string())?;
+        let mut s = lock_store(&state)?;
         let mut m: HashMap<String, usize> = HashMap::new();
         for b in s.get_shelf() {
             if is_local_book(&b) {
@@ -1989,7 +2236,7 @@ async fn books_search(
     };
 
     let sources: Vec<Value> = {
-        let mut s = state.0.lock().map_err(|e| e.to_string())?;
+        let mut s = lock_store(&state)?;
         let mut list: Vec<Value> = s
             .get_sources()
             .into_iter()
@@ -2003,6 +2250,7 @@ async fn books_search(
     };
 
     let total = sources.len();
+    let flag = jobs.restart(JobKind::Search, "all");
     let progress = Arc::new(ProgressEmitter::new(&app, "books_search_progress", total));
     progress.start(json!({ "found": 0 }));
 
@@ -2026,8 +2274,12 @@ async fn books_search(
             let ordered = Arc::clone(&ordered);
             let samples = Arc::clone(&samples);
             let recovered = Arc::clone(&recovered);
+            let flag = Arc::clone(&flag);
             handles.push(tauri::async_runtime::spawn(async move {
                 loop {
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     let index = cursor.fetch_add(1, Ordering::Relaxed);
                     if index >= sources.len() {
                         break;
@@ -2051,30 +2303,32 @@ async fn books_search(
                     match outcome {
                         Ok(Ok(raw)) => {
                             let hits = crate::relevance::filter_relevant(&key, &raw);
-                            if let Ok(mut map) = samples.lock() {
-                                map.insert(
+                            // 锁毒化时恢复而不是丢掉本次搜索的采样分
+                            samples
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(
                                     url.clone(),
                                     crate::relevance::score_match_sample(&key, &raw, &hits),
                                 );
-                            }
                             if !hits.is_empty() {
                                 found.fetch_add(hits.len(), Ordering::Relaxed);
-                                if let Ok(mut list) = ordered.lock() {
-                                    list.extend(hits.iter().cloned());
-                                }
-                                if let Ok(mut map) = recovered.lock() {
-                                    map.insert(
-                                        url,
-                                        hits[0].get("name").and_then(Value::as_str).unwrap_or("").to_string(),
-                                    );
-                                }
+                                ordered
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .extend(hits.iter().cloned());
+                                recovered.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                                    url,
+                                    hits[0].get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                                );
                                 let _ = app.emit("books_search_partial", &hits);
                             }
                         }
                         _ => {
-                            if let Ok(mut map) = samples.lock() {
-                                map.insert(url, 0.0);
-                            }
+                            samples
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(url, 0.0);
                         }
                     }
                     progress.step(&name, json!({ "found": found.load(Ordering::Relaxed) }));
@@ -2085,12 +2339,14 @@ async fn books_search(
             let _ = handle.await;
         }
     }
+    let cancelled = flag.load(Ordering::Relaxed);
+    jobs.finish(JobKind::Search, "all");
 
     // 匹配分回写：一次搜索即可让嘈杂书源降权、命中书源提权
     let updated_sources = {
-        let mut s = state.0.lock().map_err(|e| e.to_string())?;
-        let sample_map = samples.lock().map(|m| m.clone()).unwrap_or_default();
-        let hit_map = recovered.lock().map(|m| m.clone()).unwrap_or_default();
+        let mut s = lock_store(&state)?;
+        let sample_map = samples.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let hit_map = recovered.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let next: Vec<Value> = if sample_map.is_empty() && hit_map.is_empty() {
             s.get_sources()
         } else {
@@ -2139,7 +2395,7 @@ async fn books_search(
     };
 
     let final_books = {
-        let list = ordered.lock().map(|v| v.clone()).unwrap_or_default();
+        let list = ordered.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut books = crate::relevance::filter_relevant(&key, &list);
         books.sort_by(|a, b| {
             let sa = crate::relevance::title_similarity(
@@ -2173,7 +2429,7 @@ async fn books_search(
     };
 
     let history = {
-        let s = state.0.lock().map_err(|e| e.to_string())?;
+        let s = lock_store(&state)?;
         if key.is_empty() {
             s.get_search_history()
         } else {
@@ -2182,12 +2438,18 @@ async fn books_search(
     };
 
     let found_total = found.load(Ordering::Relaxed);
-    progress.finish(json!({ "found": found_total }));
+    progress.finish(json!({ "found": found_total, "phase": if cancelled { "cancelled" } else { "done" } }));
     Ok(json!({
         "books": final_books,
         "history": history,
         "sources": updated_sources,
     }))
+}
+
+/// 取消多书源搜索：只置取消标志，由 worker 收尾时 finish（见 shelf_cancel_cache）。
+#[tauri::command]
+fn books_cancel_search(jobs: State<JobsState>) {
+    jobs.cancel(JobKind::Search, "all");
 }
 
 /// 在 commands 模块内完成 generate_handler 注册
@@ -2299,6 +2561,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             sources_update,
             sources_test,
             sources_test_all,
+            sources_cancel_test_all,
             sources_remove_invalid,
             shelf_list,
             shelf_upsert,
@@ -2308,7 +2571,9 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             shelf_cache_book,
             shelf_cancel_cache,
             shelf_update_all,
+            shelf_cancel_update_all,
             shelf_export_txt,
+            shelf_cancel_export,
             shelf_import_local,
             data_legacy_status,
             data_import_legacy,
@@ -2319,6 +2584,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             books_preload,
             books_cancel_preload,
             books_search,
+            books_cancel_search,
             rank_qidian_list
         ])
 }

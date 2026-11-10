@@ -90,6 +90,9 @@ export const SettingsView = memo(function SettingsView({
           <button
             type="button"
             className={`switch ${prefs.bossKeyEnabled ? 'on' : ''}`}
+            role="switch"
+            aria-checked={prefs.bossKeyEnabled}
+            aria-label="启用老板键"
             onClick={() => void onPrefsChange({ bossKeyEnabled: !prefs.bossKeyEnabled })}
           >
             <i />
@@ -140,6 +143,9 @@ export const SettingsView = memo(function SettingsView({
           <button
             type="button"
             className={`switch ${prefs.eyeCareEnabled ? 'on' : ''}`}
+            role="switch"
+            aria-checked={prefs.eyeCareEnabled}
+            aria-label="启用护眼提醒"
             onClick={() => void onPrefsChange({ eyeCareEnabled: !prefs.eyeCareEnabled })}
           >
             <i />

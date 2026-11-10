@@ -1,7 +1,8 @@
 //! Markdown 导入：保留原文，按标题生成目录（对应 main/localBooks/mdParse.ts）。
 //!
-//! 每章 `content` 都是整份全文，阅读器靠 `md_anchor`（`md-h-{序号}`）滚动定位，
-//! 与 GitHub / Gitee 的文档页行为一致。
+//! 每章 `content` 只存该章对应的行切片（从本章标题行到下一章标题行之前），
+//! 不再每章 clone 整份全文；`md_anchor`（`md-h-{序号}`）仍为全文标题序号，
+//! 前端渲染时按章节内容内标题顺序重编锚点 id，对不上时按标题文本回退定位。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -110,14 +111,30 @@ pub fn parse_md_buffer(buf: &[u8], fallback_title: &str) -> MdMeta {
         }
         let preamble = lines[pre_start..first_line].join("\n").trim().to_string();
         if preamble.chars().count() > 40 {
-            chapters.push(SplitChapter::new("前言", text.clone()));
+            // 前言只存前言部分的行切片，不要 clone 整份全文
+            chapters.push(SplitChapter::new("前言", preamble));
         }
     }
 
-    for h in &chapter_heads {
+    // 每章只存该章对应的行切片（从本章标题行到下一章标题行之前），
+    // 不要每章 clone 整份全文：旧实现 N 章就是 N 份全文内存。
+    // 注意：md_anchor 仍为全文标题序号；前端渲染时按章节内容内标题顺序重编
+    // 锚点 id，对不上时按标题文本回退定位（见 ReaderView.findMarkdownScrollTarget），
+    // 且切片从本章标题行开始，标题本身在切片内，回退定位能找到它。
+    for (idx, h) in chapter_heads.iter().enumerate() {
+        let end = chapter_heads
+            .get(idx + 1)
+            .map(|next| next.line)
+            .unwrap_or(lines.len());
+        let content = lines[h.line..end].join("\n").trim().to_string();
+        let content = if content.is_empty() {
+            "（本章无正文）".to_string()
+        } else {
+            content
+        };
         chapters.push(SplitChapter::with_anchor(
             h.title.clone(),
-            text.clone(),
+            content,
             Some(format!("md-h-{}", h.heading_index)),
         ));
     }
@@ -275,8 +292,10 @@ mod tests {
         assert_eq!(titles(&meta), vec!["第一章 起", "第二章 承"]);
         assert_eq!(meta.chapters[0].md_anchor.as_deref(), Some("md-h-0"));
         assert_eq!(meta.chapters[1].md_anchor.as_deref(), Some("md-h-1"));
-        // 全文模式：每章内容都是整份 Markdown
-        assert_eq!(meta.chapters[1].content, md.trim());
+        // 切片模式：每章只存该章对应的行切片，不再是整份 Markdown
+        assert_eq!(meta.chapters[0].content, "# 第一章 起\n\n正文。");
+        assert_eq!(meta.chapters[1].content, "# 第二章 承\n\n正文。");
+        assert!(!meta.chapters[1].content.contains("第一章"));
     }
 
     #[test]

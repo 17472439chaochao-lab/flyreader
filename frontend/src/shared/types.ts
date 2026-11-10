@@ -207,17 +207,6 @@ export function sourceMatchStrength(
 }
 
 /**
- * 由书架上使用该源的书籍数量推导匹配基线分。
- * @param shelfCount 书架中来自该源的在线书数量
- * @returns 0～88 的基线分
- */
-export function shelfMatchBaseline(shelfCount: number): number {
-  const n = Math.max(0, Math.floor(shelfCount))
-  if (n <= 0) return 0
-  return Math.min(88, 40 + n * 12)
-}
-
-/**
  * 将匹配分数转为中文档位文案。
  * @param score 匹配分
  * @returns 「高匹配」「中匹配」「低匹配」或 null
@@ -328,18 +317,8 @@ export type BookCacheProgress = {
 }
 
 /** 书架上的一本书（含阅读进度与可选本地文件信息） */
-export interface ShelfBook {
+export interface ShelfBook extends BookInfo {
   id: string
-  name: string
-  author: string
-  bookUrl: string
-  coverUrl?: string
-  intro?: string
-  kind?: string
-  lastChapter?: string
-  origin: string
-  originName: string
-  tocUrl?: string
   chapters?: Chapter[]
   chapterIndex: number
   scrollTop: number

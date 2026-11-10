@@ -21,6 +21,12 @@ use serde_json::Value;
 
 /// 单条 @js 规则执行超时（毫秒），与 jsRule.ts 的 JS_RULE_TIMEOUT_MS 一致。
 const JS_RULE_TIMEOUT_MS: u64 = 2000;
+/// 沙箱内存上限 64MB：rquickjs 0.14 的 Runtime::set_memory_limit（docs.rs 0.14.0 核实存在，
+/// 0 表示不限；仅在使用自定义分配器时是空操作，本项目用默认分配器，故生效）。
+const JS_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+/// 沙箱栈上限 256KB：rquickjs 0.14 的 Runtime::set_max_stack_size（默认值也是 256KB，
+/// 这里显式设置，避免默认值随版本漂移）。
+const JS_MAX_STACK_SIZE_BYTES: usize = 256 * 1024;
 
 /// 注入沙箱的绑定变量
 #[derive(Clone, Copy)]
@@ -44,7 +50,11 @@ impl Default for JsBindings<'_> {
 }
 
 thread_local! {
-    static SANDBOX: RefCell<Option<(Runtime, Context)>> = const { RefCell::new(None) };
+    // 只复用 Runtime（省初始化开销），不复用 Context：
+    // 每次执行新建 Context，天然清理上一条规则留下的全局变量/未声明赋值
+    // （非严格模式下 `a=...` 会挂在全局上，复用 Context 会污染下一条规则）。
+    // 只选「每次新建 Context」这一种，不与「执行前清理全局」混用。
+    static SANDBOX: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
 /// 沙箱返回值：要么是字符串数组，要么是 JS 侧异常文本
@@ -83,10 +93,13 @@ pub fn eval_js_to_strings(code: &str, bindings: JsBindings<'_>) -> Result<Vec<St
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
             let runtime = Runtime::new().map_err(|e| format!("@js 沙箱初始化失败：{e}"))?;
-            let context = Context::full(&runtime).map_err(|e| format!("@js 沙箱初始化失败：{e}"))?;
-            *slot = Some((runtime, context));
+            runtime.set_memory_limit(JS_MEMORY_LIMIT_BYTES);
+            runtime.set_max_stack_size(JS_MAX_STACK_SIZE_BYTES);
+            *slot = Some(runtime);
         }
-        let (runtime, context) = slot.as_ref().ok_or("@js 沙箱未初始化")?;
+        let runtime = slot.as_ref().ok_or("@js 沙箱未初始化")?;
+        // 每次新建 Context：上一条规则的全局状态不会带到下一条。
+        let context = Context::full(runtime).map_err(|e| format!("@js 沙箱初始化失败：{e}"))?;
 
         // 中断器必须在 context.with 之外装卸：with 内部已持有 runtime 锁，重入会死锁。
         let started = Instant::now();
@@ -95,7 +108,7 @@ pub fn eval_js_to_strings(code: &str, bindings: JsBindings<'_>) -> Result<Vec<St
         runtime.set_interrupt_handler(None);
 
         if started.elapsed() > limit {
-            // 中断可能让 QuickJS 的引用计数停在半路，丢弃沙箱换取干净的下一轮执行。
+            // 中断可能让 QuickJS 的引用计数停在半路，丢弃整个 Runtime 换取干净的下一轮执行。
             *slot = None;
             return Err(format!("@js 规则执行超时（>{JS_RULE_TIMEOUT_MS}ms）"));
         }
@@ -154,8 +167,13 @@ fn set_bindings<'js>(
 }
 
 /// AES-CBC/PKCS7 解密，密钥长度决定 128/192/256。
+/// IV 长度必须为 16 字节（AES 分组大小），不满足显式报错，
+/// 不依赖底层 new_from_slices 的笼统报错。
 fn aes_cbc_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
     use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    if iv.len() != 16 {
+        return Err(format!("AES IV 长度必须为 16 字节，实际 {} 字节", iv.len()));
+    }
     let bad = |e| format!("AES 密钥/IV 长度不合法：{e}");
     if key.len() == 16 {
         let d = <cbc::Decryptor<aes::Aes128>>::new_from_slices(key, iv).map_err(bad)?;
@@ -174,13 +192,30 @@ fn aes_cbc_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String
     }
 }
 
+/// 只支持 CBC 模式的 transformation（如 `AES/CBC/PKCS5Padding`）：
+/// 非 CBC（如 ECB）显式报错，而不是像旧实现那样忽略参数一律按 CBC 解。
+/// trans 为 None 时视为缺省 CBC（与旧行为一致，兼容省略该参数的书源）。
+fn validate_cbc_transformation(trans: Option<&str>) -> Result<(), String> {
+    match trans {
+        None => Ok(()),
+        Some(t) if t.to_ascii_uppercase().contains("CBC") => Ok(()),
+        Some(t) => Err(format!("只支持 CBC 模式的 transformation，不支持：{t}")),
+    }
+}
+
 /// Base64 密文 → UTF-8 明文；任何一步失败都抛异常，避免把垃圾串当成章节地址去请求。
+/// 注意：解密结果若是章节地址/正文 URL，沙箱内无法区分纯文本与 URL，
+/// 统一由调用方在发出请求前校验——所有请求都经过 fetch_text 入口的
+/// validate_fetch_url（SSRF 校验），未经校验的 URL 不会发出请求。
 fn aes_base64_decode_to_string(
     ctx: &Ctx<'_>,
     text: &str,
     key: &str,
+    trans: Option<&str>,
     iv: &str,
 ) -> rquickjs::Result<String> {
+    validate_cbc_transformation(trans)
+        .map_err(|e| js_error(ctx, e))?;
     let trimmed = text.trim();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(trimmed)
@@ -199,26 +234,30 @@ fn js_error(ctx: &Ctx<'_>, message: String) -> rquickjs::Error {
 fn install_java_bridge<'js>(globals: &Object<'js>) -> rquickjs::Result<()> {
     let ctx = globals.ctx().clone();
     let java = Object::new(ctx.clone())?;
-    // 书源写成 (data, key, transformation, iv)；transformation 一律按 AES/CBC/PKCS5Padding 处理
+    // 书源写成 (data, key, transformation, iv)；transformation 必须含 CBC，
+    // 非 CBC 显式报错（见 validate_cbc_transformation），不再忽略该参数。
     java.set(
         "aesBase64DecodeToString",
         Func::from(
-            |ctx: Ctx<'js>, text: String, key: String, _trans: Option<String>, iv: String| {
-                aes_base64_decode_to_string(&ctx, &text, &key, &iv)
+            |ctx: Ctx<'js>, text: String, key: String, trans: Option<String>, iv: String| {
+                aes_base64_decode_to_string(&ctx, &text, &key, trans.as_deref(), &iv)
             },
         ),
     )?;
     java.set(
         "createSymmetricCrypto",
         Func::from(
-            move |ctx: Ctx<'js>, _trans: String, key: String, iv: String| -> rquickjs::Result<Object<'js>> {
+            move |ctx: Ctx<'js>, trans: String, key: String, iv: String| -> rquickjs::Result<Object<'js>> {
+            // 建 crypto 对象时就校验 transformation，非 CBC 直接抛错，不等到 decryptStr 才发现。
+            validate_cbc_transformation(Some(&trans)).map_err(|e| js_error(&ctx, e))?;
             let key = Arc::new(key);
             let iv = Arc::new(iv);
+            let trans = Arc::new(trans);
             let crypto = Object::new(ctx.clone())?;
             crypto.set(
                 "decryptStr",
                 Func::from(move |ctx: Ctx<'js>, text: String| {
-                    aes_base64_decode_to_string(&ctx, &text, &key, &iv)
+                    aes_base64_decode_to_string(&ctx, &text, &key, Some(&trans), &iv)
                 }),
             )?;
             Ok(crypto)
@@ -328,6 +367,57 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("Base64") || err.contains("AES"), "{err}");
+    }
+
+    #[test]
+    fn java_bridge_rejects_short_iv_and_non_cbc_transformation() {
+        // IV 不是 16 字节要显式报错，而不是解密出垃圾
+        let cipher = encrypt_b64("第 3 章", "f041c49714d39908", "0123456789abcdef");
+        let err = eval_js_to_strings(
+            "java.aesBase64DecodeToString(result,\"f041c49714d39908\",\"AES/CBC/PKCS5Padding\",\"short\")",
+            JsBindings {
+                result: &cipher,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("IV"), "{err}");
+        // 非 CBC 的 transformation 显式报错
+        let err = eval_js_to_strings(
+            "java.aesBase64DecodeToString(result,\"f041c49714d39908\",\"AES/ECB/PKCS5Padding\",\"0123456789abcdef\")",
+            JsBindings {
+                result: &cipher,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("CBC"), "{err}");
+        let err = eval_js_to_strings(
+            "java.createSymmetricCrypto(\"AES/ECB/PKCS5Padding\",\"f041c49714d39908\",\"0123456789abcdef\").decryptStr(String(result))",
+            JsBindings {
+                result: &cipher,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("CBC"), "{err}");
+    }
+
+    #[test]
+    fn js_globals_do_not_leak_between_evals() {
+        // 每次新建 Context：上一条规则未声明赋值的全局变量不得污染下一条
+        let got = eval_js_to_strings("a=String(result)+'/read'", JsBindings {
+            result: "x",
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(got, vec!["x/read".to_string()]);
+        let got = eval_js_to_strings(
+            "typeof a",
+            JsBindings::default(),
+        )
+        .unwrap();
+        assert_eq!(got, vec!["undefined".to_string()]);
     }
 
     #[test]
