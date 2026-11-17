@@ -33,7 +33,7 @@ scraper = "0.27"
 sxd-document = "0.3"
 sxd-xpath = "0.4"
 jsonpath-plus = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
@@ -41,7 +41,7 @@ sha1_smol = "1"
 tauri-plugin-global-shortcut = "2.4.0"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 
 # 体积优先（原版 Electron 包 ~108MB，目标是十 MB 级）
 [profile.release]

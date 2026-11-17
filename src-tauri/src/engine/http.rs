@@ -121,39 +121,91 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// 解析出的任一地址落入内网段即拒绝（解析失败也拒绝）。
 /// 注意：这里是请求前的校验，reqwest 发请求时会再次解析 DNS，
 /// DNS 重绑定（TOCTOU）无法仅靠请求前校验彻底消除，只能收窄窗口。
-pub(crate) fn validate_fetch_url(url: &str) -> Result<Url, String> {
+/// `validate_fetch_url` / `validate_fetch_url_async` 的共享前半段（不含 DNS）。
+/// - `Ok(Literal)`：字面量 IP，已判定放行，无需 DNS；
+/// - `Ok(Domain)`：域名，需按 `host:port` 解析后再做内网复检；
+/// - `Err`：协议/host/字面量内网 IP 校验不通过。
+enum UrlTarget {
+    Literal(Url),
+    Domain { url: Url, host: String, port: u16 },
+}
+
+fn check_url_pre_dns(url: &str) -> Result<UrlTarget, String> {
     let parsed = Url::parse(url).map_err(|e| format!("URL 解析失败：{url}（{e}）"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(format!("只允许 http/https 请求：{url}"));
     }
     let host = parsed
         .host_str()
-        .ok_or_else(|| format!("URL 缺少 host：{url}"))?;
+        .ok_or_else(|| format!("URL 缺少 host：{url}"))?
+        .to_string();
     if host.is_empty() {
         return Err(format!("URL 缺少 host：{url}"));
     }
     // 字面量 IP：直接判定，不走 DNS。
-    if let Ok(ip) = host.parse::<IpAddr>() {
+    // 用 Url::host() 而不是 host_str() 判断：IPv6 的 host_str() 带方括号（"[::1]"），
+    // 直接 parse::<IpAddr>() 一定失败，会把公网 IPv6 字面量误当域名去解析。
+    let literal_ip = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => None,
+    };
+    if let Some(ip) = literal_ip {
         if is_blocked_ip(&ip) {
             return Err(format!("拒绝请求内网/保留地址：{url}"));
         }
-        return Ok(parsed);
+        return Ok(UrlTarget::Literal(parsed));
     }
-    // 域名：解析后逐个检查，任一内网地址即拒绝；解析失败即拒绝。
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let addrs: Vec<std::net::SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("DNS 解析失败，拒绝请求：{host}（{e}）"))?
-        .collect();
+    Ok(UrlTarget::Domain {
+        url: parsed,
+        host,
+        port,
+    })
+}
+
+/// DNS 解析结果的内网复检：解析无结果或任一地址内网/保留即拒绝。
+fn ensure_public_addrs(addrs: &[std::net::SocketAddr], host: &str) -> Result<(), String> {
     if addrs.is_empty() {
         return Err(format!("DNS 解析无结果，拒绝请求：{host}"));
     }
-    for addr in &addrs {
+    for addr in addrs {
         if is_blocked_ip(&addr.ip()) {
             return Err(format!("域名解析到内网/保留地址，拒绝请求：{host} -> {}", addr.ip()));
         }
     }
-    Ok(parsed)
+    Ok(())
+}
+
+/// 同步校验（含同步 DNS）。仅供 reqwest redirect 的同步 Policy 回调等非 async 路径使用。
+/// async 取页入口请优先用 `validate_fetch_url_async`，避免同步 DNS 阻塞 runtime 线程、
+/// 并让请求级 `timeout` 能真正中断挂起的解析。
+pub(crate) fn validate_fetch_url(url: &str) -> Result<Url, String> {
+    match check_url_pre_dns(url)? {
+        UrlTarget::Literal(u) => Ok(u),
+        UrlTarget::Domain { url: target, host, port } => {
+            let addrs: Vec<std::net::SocketAddr> = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| format!("DNS 解析失败，拒绝请求：{host}（{e}）"))?
+                .collect();
+            ensure_public_addrs(&addrs, &host).map(|_| target)
+        }
+    }
+}
+
+/// 异步校验：域名走 `tokio::net::lookup_host`，解析可被外层 `timeout` 取消，
+/// 不会阻塞 tokio worker 线程（并发书源测试卡顿/停滞的根因修复）。
+pub(crate) async fn validate_fetch_url_async(url: &str) -> Result<Url, String> {
+    match check_url_pre_dns(url)? {
+        UrlTarget::Literal(u) => Ok(u),
+        UrlTarget::Domain { url: target, host, port } => {
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| format!("DNS 解析失败，拒绝请求：{host}（{e}）"))?
+                .collect();
+            ensure_public_addrs(&addrs, &host).map(|_| target)
+        }
+    }
 }
 
 /// 方法白名单：只允许 GET/POST/PUT/DELETE/HEAD，其余一律拒绝。
@@ -215,7 +267,7 @@ pub async fn fetch_bytes_limited(
     url: &str,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, Option<String>), String> {
-    let validated = validate_fetch_url(url)?;
+    let validated = validate_fetch_url_async(url).await?;
     let resp = client()
         .get(validated.clone())
         .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
@@ -254,7 +306,7 @@ pub async fn fetch_text(url: &str, options: &FetchOptions) -> Result<Page, Strin
             ));
         }
     }
-    let validated = validate_fetch_url(url)?;
+    let validated = validate_fetch_url_async(url).await?;
 
     let has_accept = options
         .headers
@@ -671,6 +723,31 @@ mod tests {
         assert!(validate_fetch_url("http://[::ffff:127.0.0.1]/x").is_err());
         assert!(validate_fetch_url("https://8.8.8.8/x").is_ok());
         assert!(validate_fetch_url("https://1.1.1.1/x").is_ok());
+    }
+
+    #[tokio::test]
+    async fn validate_fetch_url_async_matches_sync_on_literals() {
+        // 异步校验对协议与字面量 IP 的判定应与同步一致，且不触发真实 DNS。
+        assert!(validate_fetch_url_async("file:///etc/passwd").await.is_err());
+        assert!(validate_fetch_url_async("ftp://example.com/x").await.is_err());
+        assert!(validate_fetch_url_async("").await.is_err());
+        assert!(validate_fetch_url_async("http://127.0.0.1/").await.is_err());
+        assert!(validate_fetch_url_async("http://10.0.0.5/x").await.is_err());
+        assert!(validate_fetch_url_async("http://192.168.1.1/x").await.is_err());
+        assert!(validate_fetch_url_async("http://[::1]/x").await.is_err());
+        assert!(validate_fetch_url_async("https://8.8.8.8/x").await.is_ok());
+        assert!(validate_fetch_url_async("https://1.1.1.1/x").await.is_ok());
+        // IPv6 字面量：host_str() 带方括号，必须认出是 IP 才不会误走 DNS
+        assert!(validate_fetch_url_async("https://[2606:4700:4700::1111]/x").await.is_ok());
+        assert!(validate_fetch_url_async("http://[::ffff:127.0.0.1]/x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_fetch_url_async_rejects_unresolvable_domain() {
+        // 不存在的域名：异步 DNS 解析失败应被拒绝（.invalid 保证不命中真实解析），
+        // 验证可被外层 timeout 取消且不阻塞 runtime worker。
+        let r = validate_fetch_url_async("http://this-domain-should-not-exist.invalid/x").await;
+        assert!(r.is_err());
     }
 
     #[test]

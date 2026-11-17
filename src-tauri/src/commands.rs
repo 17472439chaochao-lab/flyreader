@@ -491,16 +491,8 @@ async fn test_one_source(
     keyword: Option<String>,
     history: Vec<String>,
 ) -> (String, Value) {
-    let name = source
-        .get("bookSourceName")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let url = source
-        .get("bookSourceUrl")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let name = str_of(&source, "bookSourceName").to_string();
+    let url = str_of(&source, "bookSourceUrl").to_string();
     let outcome = tokio::time::timeout(
         Duration::from_millis(SOURCE_TEST_TIMEOUT_MS),
         test_source(&source, keyword.as_deref(), &history),
@@ -538,7 +530,7 @@ async fn sources_test_all(
         let list = match &filter {
             Some(set) => all
                 .into_iter()
-                .filter(|s| set.contains(s.get("bookSourceUrl").and_then(Value::as_str).unwrap_or("")))
+                .filter(|s| set.contains(str_of(s, "bookSourceUrl")))
                 .collect(),
             None => all,
         };
@@ -573,16 +565,33 @@ async fn sources_test_all(
                     break;
                 }
                 let index = cursor.fetch_add(1, Ordering::Relaxed);
-                if index >= list.len() {
+                let Some(source) = list.get(index).cloned() else {
                     break;
-                }
-                let source = list[index].clone();
-                let name = source
-                    .get("bookSourceName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let (url, result) = test_one_source(source, keyword.clone(), history.clone()).await;
+                };
+                let name = str_of(&source, "bookSourceName").to_string();
+                let fallback_url = str_of(&source, "bookSourceUrl").to_string();
+                // 每条书源单独起一个任务：即使某条书源（或第三方解析库）panic，
+                // 也只是这一条记为失败，不会像以前那样把 worker 打死导致整批测试
+                // 测到前几个就静默结束。
+                let outcome = tauri::async_runtime::spawn(test_one_source(
+                    source,
+                    keyword.clone(),
+                    history.clone(),
+                ))
+                .await;
+                let (url, result) = match outcome {
+                    Ok(pair) => pair,
+                    Err(e) => (
+                        fallback_url,
+                        json!({
+                            "ok": false,
+                            "message": format!("测试异常退出：{e}"),
+                            "found": 0,
+                            "respondMs": 0,
+                            "structuralOk": true
+                        }),
+                    ),
+                };
                 let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
                 // 锁毒化时恢复而不是丢掉本次测试结果
                 outcomes.lock().unwrap_or_else(|e| e.into_inner()).insert(url, result);
@@ -590,10 +599,17 @@ async fn sources_test_all(
             }
         }));
     }
+    let mut join_err = 0usize;
     for h in handles {
-        let _ = h.await;
+        if h.await.is_err() {
+            join_err += 1;
+        }
     }
     let cancelled = flag.load(Ordering::Relaxed);
+    if join_err > 0 {
+        // worker 自己异常退出（正常路径不该发生）：留痕但不影响其余书源的结果落库。
+        eprintln!("sources_test_all: {join_err} 个 worker 异常退出（total={total}, concurrency={concurrency}）");
+    }
     jobs.finish(JobKind::TestAll, "all");
     progress.finish(json!({ "phase": if cancelled { "cancelled" } else { "done" } }));
 
@@ -603,7 +619,7 @@ async fn sources_test_all(
         .get_sources()
         .into_iter()
         .map(|s| {
-            let url = s.get("bookSourceUrl").and_then(Value::as_str).unwrap_or("");
+            let url = str_of(&s, "bookSourceUrl");
             match map.get(url) {
                 Some(result) => {
                     let mut merged = s;
@@ -1837,18 +1853,26 @@ fn source_of(state: &State<StoreState>, origin: &str) -> Option<Value> {
         .find(|s| s.get("bookSourceUrl").and_then(Value::as_str) == Some(origin))
 }
 
+/// 从设置里取并发数（设置页保存的是浮点数，如 `8.0`）。
+/// 只认 `as_u64()` 会让 8.0 落到 `unwrap_or(4)`，并发永远被压回 4。
+fn concurrency_from_prefs(prefs: &Value) -> usize {
+    let value = prefs.get("requestConcurrency");
+    let n = value
+        .and_then(Value::as_u64)
+        .or_else(|| value.and_then(Value::as_f64).map(|f| f.round() as u64))
+        .unwrap_or(4);
+    (n as usize).clamp(1, 16)
+}
+
 fn request_concurrency(state: &State<StoreState>) -> usize {
-    let n = state
+    state
         .0
         .lock()
         .map(|mut s| {
-            s.get_prefs()
-                .get("requestConcurrency")
-                .and_then(Value::as_u64)
-                .unwrap_or(4) as usize
+            let prefs = s.get_prefs();
+            concurrency_from_prefs(&prefs)
         })
-        .unwrap_or(4);
-    n.clamp(1, 16)
+        .unwrap_or(4)
 }
 
 /// 正文是否仍像 Markdown（对应 isMarkdownLocalBook 的兜底分支）。
@@ -2652,6 +2676,16 @@ mod tests {
         let kept = merge_book_info(&book, &info, "", &chapters, None);
         assert!(kept.get("chapterIndex").is_none());
         assert_eq!(kept["tocUrl"], json!("old"));
+    }
+
+    #[test]
+    fn request_concurrency_reads_float_pref() {
+        // 设置页把并发存成浮点（8.0）：只认 as_u64() 会让并发永远退回 4
+        assert_eq!(concurrency_from_prefs(&json!({ "requestConcurrency": 8.0 })), 8);
+        assert_eq!(concurrency_from_prefs(&json!({ "requestConcurrency": 4 })), 4);
+        assert_eq!(concurrency_from_prefs(&json!({})), 4);
+        assert_eq!(concurrency_from_prefs(&json!({ "requestConcurrency": 99.0 })), 16);
+        assert_eq!(concurrency_from_prefs(&json!({ "requestConcurrency": 0.0 })), 1);
     }
 
     #[test]

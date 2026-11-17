@@ -152,8 +152,10 @@ fn strip_html_shape(s: &str) -> String {
     // 正文最终以纯文本段落呈现，残留标签只影响排版、不执行脚本。
     let mut out = strip_unclosed_script_style(s);
     for (pattern, replacement) in [
-        // 脚本与样式整块丢弃（含其后一个闭合标签由非贪婪匹配保证）
-        (r"(?is)<(script|style)[^>]*>.*?</\1>", ""),
+        // 脚本与样式整块丢弃。`regex` crate 不支持反向引用（`\1`），
+        // 写成 `<(script|style)…</\1>` 会让 Regex::new 直接失败、整条规则被静默跳过，
+        // 脚本正文就会漏进正文里，所以这里用显式两条分支。
+        (r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>", ""),
         (r"(?i)<br\s*/?>", "\n"),
         (r"(?i)</?(p|div|section|article|tr|li|h[1-6]|blockquote)(\s[^>]*)?>", "\n"),
         (r"(?s)<[^>]+>", ""),

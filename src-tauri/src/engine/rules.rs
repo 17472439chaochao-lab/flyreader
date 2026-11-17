@@ -459,20 +459,36 @@ fn json_path_selector(selector: &str) -> String {
     }
 }
 
+/// JSONPath 求值入口（含 panic 收敛），analyze_json / get_elements_detailed 共用。
+fn jsonpath_find<'a>(path: &str, data: &'a Value) -> Result<Vec<&'a Value>, String> {
+    // jsonpath-plus 0.1.x 的 `ParseError::Display` 里是 `todo!()`（见该 crate 的
+    // src/error.rs），路径解析失败后只要被格式化就一定 panic。批量测试时一条坏规则
+    // 就能把 worker 任务打死，表现为“测到前几个就断开”。这里既不碰 Display，
+    // 也不让 panic 逃出去：一律收敛成普通诊断文本。
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jsonpath_plus::find(path, data)));
+    match outcome {
+        Ok(Ok(found)) => Ok(found),
+        Ok(Err(_)) => Err(format!("JSONPath 语法错误（不支持的写法？）：{path}")),
+        Err(_) => Err(format!("JSONPath 求值异常（第三方库 panic，已忽略）：{path}")),
+    }
+}
+
+/// 按规则从 JSON 里取值：`rule` 里可能带 `@text` 之类后缀，先剥再当路径用。
+fn jsonpath_select<'a>(data: &'a Value, rule: &str) -> Result<Vec<&'a Value>, String> {
+    let parsed = parse_rule_parts_cached(rule);
+    jsonpath_find(&jsonpath_of(&json_path_selector(&parsed.selector)), data)
+}
+
 /// JSONPath 取值，对应 analyzeJson。
 fn analyze_json(content: &str, rule: &str, single: bool) -> (Vec<String>, Option<String>) {
     let parsed = parse_rule_parts_cached(rule);
     let Ok(data) = serde_json::from_str::<Value>(content) else {
         return (Vec::new(), Some("JSON 解析失败：内容不是合法 JSON".to_string()));
     };
-    let found = match jsonpath_plus::find(&jsonpath_of(&json_path_selector(&parsed.selector)), &data) {
+    let found = match jsonpath_select(&data, rule) {
         Ok(v) => v,
-        Err(e) => {
-            return (
-                Vec::new(),
-                Some(format!("JSONPath 求值失败：{}（{}）", parsed.selector, e)),
-            );
-        }
+        Err(diag) => return (Vec::new(), Some(diag)),
     };
     let mut out = Vec::new();
     for item in found {
@@ -667,17 +683,13 @@ pub fn get_elements_detailed(content: &str, rule: Option<&str>) -> (Vec<String>,
             let Ok(data) = serde_json::from_str::<Value>(content) else {
                 return (Vec::new(), Some("JSON 解析失败：内容不是合法 JSON".to_string()));
             };
-            let parsed = parse_rule_parts_cached(rule);
-            let path = jsonpath_of(&json_path_selector(&parsed.selector));
-            match jsonpath_plus::find(&path, &data) {
+            // 列表规则只取原始值，不套 analyze_json 的正则链（两者语义不同）
+            match jsonpath_select(&data, rule) {
                 Ok(found) => (
                     found.iter().map(|item| json_value_to_string(item)).collect(),
                     None,
                 ),
-                Err(e) => (
-                    Vec::new(),
-                    Some(format!("JSONPath 求值失败：{path}（{e}）")),
-                ),
+                Err(diag) => (Vec::new(), Some(diag)),
             }
         }
         Mode::XPath => {
@@ -1014,15 +1026,21 @@ mod tests {
         // CSS 选择器编译失败：诊断带出原因，而不是只返回空列表
         let (out, diag) = get_string_list_detailed(HTML, Some(".bookbox[[["), "", true);
         assert!(out.is_empty());
-        assert!(diag.is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
+        assert!(diag.as_ref().is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
         // JSON 内容配 JSON 规则但路径非法
         let (out, diag) = get_string_list_detailed("not json", Some("$.data"), "", true);
         assert!(out.is_empty());
-        assert!(diag.is_some_and(|d| d.contains("JSON")), "diag={diag:?}");
-        // @js 报错同样透传
-        let (out, diag) = get_string_list_detailed(HTML, Some("@js:throw new Error('炸了')"), "", true);
+        assert!(diag.as_ref().is_some_and(|d| d.contains("JSON")), "diag={diag:?}");
+        // @js 报错同样透传（`throw` 是语句，规则里必须包成函数调用才是运行时异常，
+        // 否则只会得到语法错误）
+        let (out, diag) = get_string_list_detailed(
+            HTML,
+            Some("@js:(function(){throw new Error('炸了')})()"),
+            "",
+            true,
+        );
         assert!(out.is_empty());
-        assert!(diag.is_some_and(|d| d.contains("炸了")), "diag={diag:?}");
+        assert!(diag.as_ref().is_some_and(|d| d.contains("炸了")), "diag={diag:?}");
         // 规则合法但无匹配：诊断为 None（不是失败）
         let (out, diag) = get_string_list_detailed(HTML, Some(".不存在@text"), "", true);
         assert!(out.is_empty());
@@ -1030,7 +1048,27 @@ mod tests {
         // 列表规则同理
         let (items, diag) = get_elements_detailed(HTML, Some(".bookbox[[["));
         assert!(items.is_empty());
-        assert!(diag.is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
+        assert!(diag.as_ref().is_some_and(|d| d.contains("CSS")), "diag={diag:?}");
+    }
+
+    #[test]
+    fn jsonpath_parse_error_reports_instead_of_panicking() {
+        // jsonpath-plus 0.1.x 的 ParseError::Display 里是 todo!()：旧实现在这里
+        // 直接 panic，批量书源测试会把 worker 任务打死（表现为“测几个就断开”）。
+        let (out, diag) =
+            get_string_list_detailed(r#"{"data":{"a":1}}"#, Some("$.data["), "", true);
+        assert!(out.is_empty());
+        assert!(
+            diag.as_ref().is_some_and(|d| d.contains("JSONPath")),
+            "diag={diag:?}"
+        );
+        // 列表规则同样不能 panic
+        let (items, diag) = get_elements_detailed(r#"{"data":[{"a":1}]}"#, Some("$.data["));
+        assert!(items.is_empty());
+        assert!(
+            diag.as_ref().is_some_and(|d| d.contains("JSONPath")),
+            "diag={diag:?}"
+        );
     }
 
     #[test]
